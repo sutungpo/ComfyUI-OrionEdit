@@ -15,8 +15,11 @@ if "processors" not in folder_paths.folder_names_and_paths:
         "processors", os.path.join(folder_paths.models_dir, "processors")
     )
 
-# Import Orion block processors from local models package
-from .transformer_orion import set_orion_block_processors
+# Resilient import: works whether transformer_orion.py is in the root or a models/ subfolder
+try:
+    from .transformer_orion import set_orion_block_processors
+except ImportError:
+    from .models.transformer_orion import set_orion_block_processors
 
 
 # ==========================================
@@ -24,7 +27,16 @@ from .transformer_orion import set_orion_block_processors
 # ==========================================
 
 def _pack_latents_2d(latents: torch.Tensor) -> torch.Tensor:
-    """Pack [B, C, H, W] -> [B, (H//2)*(W//2), C*4]."""
+    """Pack [B, C, H, W] or [B, C, 1, H, W] -> [B, (H//2)*(W//2), C*4]."""
+    # Handle 5D spatio-temporal latents from Qwen-Image 3D VAE
+    if latents.ndim == 5:
+        if latents.shape[2] == 1:
+            latents = latents.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
+        elif latents.shape[1] == 1:
+            latents = latents.squeeze(1)  # [B, 1, C, H, W] -> [B, C, H, W]
+        else:
+            latents = latents[:, :, 0, :, :]
+
     B, C, H, W = latents.shape
     x = latents.view(B, C, H // 2, 2, W // 2, 2)
     x = x.permute(0, 2, 4, 1, 3, 5)
@@ -93,7 +105,7 @@ class ApplyOrionEditPatcher:
     def INPUT_TYPES(s):
         proc_files = folder_paths.get_filename_list("processors")
         if not proc_files:
-            # Fallback scan in loras directory
+            # Fallback scan in loras directory if user placed it there
             proc_files = [f for f in folder_paths.get_filename_list("loras") if "proc" in f.lower()]
         proc_list = proc_files if proc_files else ["None"]
 
@@ -112,6 +124,7 @@ class ApplyOrionEditPatcher:
     CATEGORY = "OrionEdit"
 
     def apply_patcher(self, model, processor_name, lora_name, soft_beta, lora_strength):
+        print(f"\n[OrionEdit] Initializing ApplyOrionEditPatcher...")
         # 1. Strictly adhere to ComfyUI contract: clone ModelPatcher
         model = model.clone()
 
@@ -119,39 +132,65 @@ class ApplyOrionEditPatcher:
         if lora_name != "None":
             lora_path = folder_paths.get_full_path("loras", lora_name)
             if lora_path and os.path.exists(lora_path):
+                print(f"[OrionEdit] Loading LoRA: {lora_name} (strength: {lora_strength})")
                 lora_weights = comfy.utils.load_torch_file(lora_path)
                 model, _ = comfy.sd.load_lora_for_models(model, None, lora_weights, lora_strength, 0)
+                print(f"[OrionEdit] LoRA successfully patched to model.")
+            else:
+                print(f"[OrionEdit Warning] LoRA file not found: {lora_name}")
 
         # 3. Inject Orion Attention Processors onto Diffusion Transformer
         target_model = getattr(model.model, "diffusion_model", model.model)
+        print(f"[OrionEdit] Installing 3-stage processors across 60 transformer layers...")
         set_orion_block_processors(target_model, d=3072, rank=256, use_gate=False)
 
-        # 4. Load Tri-Orthogonal processor weights into Stage C layers (40..59)
+        # 4. Safely load Tri-Orthogonal processor weights directly into the processors
         if processor_name != "None":
             proc_path = folder_paths.get_full_path("processors", processor_name)
             if not proc_path:
                 proc_path = folder_paths.get_full_path("loras", processor_name)
 
             if proc_path and os.path.exists(proc_path):
+                print(f"[OrionEdit] Loading processor weights from: {proc_path}")
                 state = load_sft(proc_path, device="cpu")
-                dec_sd = {}
-                for key, val in state.items():
-                    if "attn.processor" in key:
-                        clean_key = key
-                        for prefix in ["transformer.", "diffusion_model.", "model."]:
-                            if clean_key.startswith(prefix):
-                                clean_key = clean_key[len(prefix):]
-                        dec_sd[clean_key] = val
-                target_model.load_state_dict(dec_sd, strict=False)
+                
+                # Group keys by block index: transformer_blocks.{i}.attn.processor...
+                loaded_count = 0
+                for bi, blk in enumerate(target_model.transformer_blocks):
+                    proc = getattr(blk.attn, "processor", None)
+                    if proc is not None and hasattr(proc, "state_dict"):
+                        prefix_candidates = [
+                            f"transformer.transformer_blocks.{bi}.attn.processor.",
+                            f"transformer_blocks.{bi}.attn.processor.",
+                            f"diffusion_model.transformer_blocks.{bi}.attn.processor.",
+                        ]
+                        proc_sd = {}
+                        for k, v in state.items():
+                            for pfx in prefix_candidates:
+                                if k.startswith(pfx):
+                                    sub_key = k[len(pfx):]
+                                    proc_sd[sub_key] = v
+                                    break
+                        if proc_sd:
+                            proc.load_state_dict(proc_sd, strict=False)
+                            loaded_count += len(proc_sd)
+
+                print(f"[OrionEdit] Successfully injected {loaded_count} processor tensors into attention blocks.")
+            else:
+                print(f"[OrionEdit Warning] Processor file not found: {processor_name}")
 
         # 5. Intercept KSampler execution via native function wrapper
         def orion_unet_wrapper(apply_model, args):
-            latent_in = args["input"]  # [B, 16, H//8, W//8]
+            latent_in = args["input"]
             c = args["c"]
             transformer_options = c.get("transformer_options", {})
+            
+            # Check multiple standard ComfyUI locations where cond metadata might live
             cond_orion = c.get("orion_cond", None)
+            if cond_orion is None and "transformer_options" in c:
+                cond_orion = c["transformer_options"].get("orion_cond", None)
 
-            # If conditioning doesn't come from OrionPrep, run standard pass
+            # If this is purely unconditional and Orion cond is absent, proceed normally
             if cond_orion is None:
                 return apply_model(latent_in, args["timestep"], **c)
 
@@ -159,7 +198,10 @@ class ApplyOrionEditPatcher:
             seg_slices_img = cond_orion["seg_slices_img"]
             img_shapes = cond_orion["img_shapes"]
 
-            B, C, H, W = latent_in.shape
+            orig_ndim = latent_in.ndim
+            H, W = latent_in.shape[-2], latent_in.shape[-1]
+            C = latent_in.shape[1] if (orig_ndim == 4 or latent_in.shape[1] != 1) else latent_in.shape[2]
+
             syn_packed = _pack_latents_2d(latent_in)
 
             # Sequence: [syn | ref | src]
@@ -167,22 +209,30 @@ class ApplyOrionEditPatcher:
                 [syn_packed, ref_latents.to(syn_packed.device, dtype=syn_packed.dtype)], dim=1
             )
 
-            # Inject Orion slice routing and stage parameters
+            # Pass Orion parameters into transformer_options
             attn_kwargs = transformer_options.get("attention_kwargs", {}).copy()
             attn_kwargs["seg_slices_img"] = seg_slices_img
             attn_kwargs["soft_beta"] = soft_beta
             transformer_options["attention_kwargs"] = attn_kwargs
+            transformer_options["orion_cond"] = cond_orion
             c["transformer_options"] = transformer_options
             c["img_shapes"] = img_shapes
 
-            # Forward pass through streamed INT8 blocks
             out = apply_model(packed_input, args["timestep"], **c)
 
-            # Slice target portion and unpack back to standard latent format
             syn_out = out[:, :syn_packed.shape[1], :]
-            return _unpack_latents_2d(syn_out, H, W, C=16)
+            unpacked = _unpack_latents_2d(syn_out, H, W, C=C)
+
+            if orig_ndim == 5:
+                if latent_in.shape[1] == 1:
+                    unpacked = unpacked.unsqueeze(1)
+                else:
+                    unpacked = unpacked.unsqueeze(2)
+
+            return unpacked
 
         model.set_model_unet_function_wrapper(orion_unet_wrapper)
+        print(f"[OrionEdit] Function wrapper attached to model. Ready for KSampler.\n")
         return (model,)
 
 
@@ -214,6 +264,8 @@ class OrionEditPrepConditioning:
     def prepare(self, conditioning, vae, reference_image_1, width, height,
                 reference_image_2=None, source_image=None):
 
+        print(f"\n[OrionEdit Prep] Preparing condition latents and image stream slices...")
+
         def tensor2pil(img_tensor):
             if img_tensor.ndim == 4:
                 img_tensor = img_tensor[0]
@@ -234,30 +286,40 @@ class OrionEditPrepConditioning:
             source_pil = tensor2pil(source_image)
             composed_ref = _build_composited_reference_canvas(refs, source_pil)
             condition_pils = [composed_ref, source_pil]
+            print(f"[OrionEdit Prep] Mode: EDITING (1 composited reference canvas + 1 source image)")
         else:
             condition_pils = refs
+            print(f"[OrionEdit Prep] Mode: FUSION ({len(refs)} reference images)")
 
-        # 2. Rescale condition images to target VAE dimensions
+        # 2. Rescale condition images to target VAE dimensions and encode
         vae_image_sizes = []
         packed_cond_list = []
         packed_lengths = []
+        detected_5d = False
 
-        for img in condition_pils:
+        for idx, img in enumerate(condition_pils):
             vw, vh = calculate_dimensions(1024 * 1024, img.width / img.height)
             vae_image_sizes.append((vw, vh))
             img_resized = img.resize((vw, vh), Image.BICUBIC)
 
-            # Native VAE encode -> [1, 16, vh//8, vw//8]
+            # Native VAE encode
             lat = vae.encode(pil2tensor(img_resized)[:, :, :, :3])
+            print(f"[OrionEdit Prep] Condition Image {idx+1} ({vw}x{vh}) encoded to VAE latent shape: {list(lat.shape)}")
+            
+            if lat.ndim == 5:
+                detected_5d = True
+
             packed_lat = _pack_latents_2d(lat)
             packed_cond_list.append(packed_lat)
             packed_lengths.append(packed_lat.shape[1])
 
         packed_cond_latents = torch.cat(packed_cond_list, dim=1)
+        print(f"[OrionEdit Prep] Total packed condition sequence length: {packed_cond_latents.shape[1]}")
 
         # 3. Compute slice indices and 3D positional grid shapes
         L_syn = (height // 16) * (width // 16)
         seg_slices_img = build_dns_seg_slices(L_syn, packed_lengths, has_source=has_source)
+        print(f"[OrionEdit Prep] Stream Slices -> syn: {seg_slices_img['syn']}, ref: {seg_slices_img['ref']}, src: {seg_slices_img['src']}")
 
         img_shapes = [
             [
@@ -277,13 +339,158 @@ class OrionEditPrepConditioning:
             }
             new_conditioning.append([emb, new_meta])
 
-        # 5. Output target noise latent placeholder for KSampler
-        latent_target = {
-            "samples": torch.zeros(1, 16, height // 8, width // 8, dtype=torch.float32)
-        }
+        # 5. Output target noise latent placeholder matching VAE dimensionality (4D vs 5D)
+        if detected_5d:
+            sample_tensor = torch.zeros(1, 16, 1, height // 8, width // 8, dtype=torch.float32)
+        else:
+            sample_tensor = torch.zeros(1, 16, height // 8, width // 8, dtype=torch.float32)
+
+        print(f"[OrionEdit Prep] Target latent placeholder shape: {list(sample_tensor.shape)}\n")
+        latent_target = {"samples": sample_tensor}
 
         return (new_conditioning, latent_target)
 
+# ==========================================
+# Custom Node 3: OrionEdit helper
+# ==========================================
+import inspect
+import os
+import sys
+import torch
+import torch.nn.functional as F
+
+class QwenAttentionSpyNode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "spy_attention"
+    CATEGORY = "OrionEdit"
+
+    def spy_attention(self, model):
+        print("\n" + "=" * 80)
+        print("[AttentionSpy] STATIC ATTENTION INSPECTION")
+        print("=" * 80)
+
+        diff_model = model.diffusion_model
+        print(f"[*] Diffusion Model: {diff_model.__class__.__module__}.{diff_model.__class__.__name__}")
+        print(f"[*] Defined in File: {inspect.getfile(diff_model.__class__)}")
+
+        # 1. Locate Transformer Blocks
+        blocks = None
+        for attr in ["transformer_blocks", "double_blocks", "blocks", "layers"]:
+            if hasattr(diff_model, attr):
+                blocks = getattr(diff_model, attr)
+                break
+
+        if blocks is None:
+            print("[X] Could not locate transformer blocks.")
+            return (model,)
+
+        sample_block = blocks[0]
+        
+        # 2. Locate Attention Module
+        attn_module = None
+        attn_attr = None
+        for attr in ["attn", "attn1", "self_attn", "joint_attn"]:
+            if hasattr(sample_block, attr):
+                attn_module = getattr(sample_block, attr)
+                attn_attr = attr
+                break
+
+        if attn_module is None:
+            print("[X] Could not locate attention module inside block.")
+            return (model,)
+
+        # 3. Log Module Identity & Source File
+        attn_cls = attn_module.__class__
+        print(f"[*] Attention Attribute: block.{attn_attr}")
+        print(f"[*] Attention Class:     {attn_cls.__module__}.{attn_cls.__name__}")
+        print(f"[*] Defined in File:     {inspect.getfile(attn_cls)}")
+
+        # 4. Check for Diffusers-style Processor vs Native Forward
+        if hasattr(attn_module, "processor"):
+            proc = attn_module.processor
+            print(f"[*] Execution Delegate:  Uses .processor -> {proc.__class__.__module__}.{proc.__class__.__name__}")
+            print(f"[*] Processor File:      {inspect.getfile(proc.__class__)}")
+            exec_target = proc.forward if hasattr(proc, "forward") else proc.__call__
+        else:
+            print("[*] Execution Delegate:  Native forward method (No .processor attribute)")
+            exec_target = attn_module.forward
+
+        # 5. Print Source Code of the Attention Forward Implementation
+        print("\n" + "-" * 80)
+        print("[AttentionSpy] SOURCE CODE OF THE EXECUTING ATTENTION FUNCTION:")
+        print("-" * 80)
+        try:
+            source_lines, start_line = inspect.getsourcelines(exec_target)
+            print(f"// File: {inspect.getfile(exec_target)} (Lines {start_line}-{start_line + len(source_lines)})")
+            for line in source_lines[:45]:  # print first 45 lines
+                print(line, end="")
+            if len(source_lines) > 45:
+                print("\n... [truncated for readability] ...")
+        except Exception as e:
+            print(f"Could not retrieve source code: {e}")
+        print("-" * 80 + "\n")
+
+        # 6. Runtime Trap: Intercept the Exact Low-Level Attention Function
+        active_block_idx = {"current": None}
+        original_sdpa = F.scaled_dot_product_attention
+
+        def sdpa_interceptor(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, **kwargs):
+            if active_block_idx["current"] is not None:
+                b_idx = active_block_idx["current"]
+                active_block_idx["current"] = None  # log only once per step
+
+                # Examine caller stack
+                stack = inspect.stack()
+                caller_frame = stack[1]
+                
+                print("=" * 80)
+                print(f"[AttentionSpy] RUNTIME EXECUTION DISPATCH (Block #{b_idx})")
+                print("=" * 80)
+                print(f"[*] Core Math Function:   torch.nn.functional.scaled_dot_product_attention")
+                print(f"[*] Called from Function: {caller_frame.function}")
+                print(f"[*] Caller File:          {caller_frame.filename} (Line {caller_frame.lineno})")
+                print(f"[*] Query Shape:          {list(query.shape)} (dtype={query.dtype}, device={query.device})")
+                print(f"[*] Key Shape:            {list(key.shape)}")
+                print(f"[*] Value Shape:          {list(value.shape)}")
+                print(f"[*] Attention Mask:       {'Present ' + str(list(attn_mask.shape)) if attn_mask is not None else 'None (Fully Bidirectional)'}")
+                print(f"[*] Dropout / Causal:     dropout={dropout_p}, is_causal={is_causal}")
+
+                # Detect Active PyTorch SDPA Backend
+                if torch.cuda.is_available():
+                    backends = {
+                        "FlashAttention": torch.backends.cuda.flash_sdp_enabled(),
+                        "MemEfficient (xformers-like)": torch.backends.cuda.mem_efficient_sdp_enabled(),
+                        "Math (standard)": torch.backends.cuda.math_sdp_enabled(),
+                    }
+                    print(f"[*] Enabled PyTorch SDPA Backends: {backends}")
+                print("=" * 80 + "\n")
+
+            if scale is not None:
+                return original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+            return original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
+
+        # Apply interceptor
+        F.scaled_dot_product_attention = sdpa_interceptor
+
+        # Attach pre-hook to know which block is active
+        def pre_hook(idx):
+            def _fn(module, args, kwargs):
+                active_block_idx["current"] = idx
+            return _fn
+
+        for target_idx in [0, 40]:
+            if target_idx < len(blocks):
+                getattr(blocks[target_idx], attn_attr).register_forward_pre_hook(pre_hook(target_idx), with_kwargs=True)
+
+        return (model,)
 
 # ==========================================
 # Node Registration Mapping
@@ -292,9 +499,11 @@ class OrionEditPrepConditioning:
 NODE_CLASS_MAPPINGS = {
     "ApplyOrionEditPatcher": ApplyOrionEditPatcher,
     "OrionEditPrepConditioning": OrionEditPrepConditioning,
+    "QwenAttentionSpyNode": QwenAttentionSpyNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ApplyOrionEditPatcher": "Apply OrionEdit Patcher",
     "OrionEditPrepConditioning": "OrionEdit Prep Latents & Conditioning",
+    "QwenAttentionSpyNode": "Debug Qwen Attention Spy",
 }
