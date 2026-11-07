@@ -414,7 +414,7 @@ class ApplyOrionEditAttention:
                 "mode": (["edit", "fusion"], {"default": "edit"}),
                 "processor_weights": (
                     "STRING",
-                    {"default": "orionedit/pytorch_processor_weights.safetensors"}
+                    {"default": "loras/pytorch_processor_weights.safetensors"}
                 ),
             }
         }
