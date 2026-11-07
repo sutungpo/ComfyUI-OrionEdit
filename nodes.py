@@ -1,546 +1,258 @@
 # ==========================================
 # Custom Node 1: OrionEdit ApplyOrionEditAttention
 # ==========================================
-"""OrionEdit attention adapter for ComfyUI Qwen Image Edit 2511.
-
-This node patches only the attention execution of the existing Qwen double-stream
-blocks. The original projection modules (including INT8/ConvRot implementations)
-remain owned and executed by ComfyUI.
-
-Install this folder under ComfyUI/custom_nodes/ComfyUI_OrionEdit/.
-"""
-
-from __future__ import annotations
-
 import os
-import threading
-import types
-from typing import Any, Dict, Optional, Tuple
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import folder_paths
+from safetensors.torch import load_file
 
-try:
-    from safetensors.torch import load_file
-    from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention_masked
-    from comfy.ldm.flux.math import apply_rope1
-except Exception as exc:  # pragma: no cover - import error is reported by ComfyUI
-    raise ImportError(
-        "ComfyUI_OrionEdit must be installed inside ComfyUI and requires safetensors."
-    ) from exc
+A_END, B_END, N_BLOCKS = 20, 40, 60
 
 
-_STAGE_A_END = 20
-_STAGE_B_END = 40
-_TOTAL_BLOCKS = 60
-_PATCH_LOCK = threading.RLock()
+def _rope(q, k, pe):
+    if pe is not None:
+        from comfy.ldm.flux.math import apply_rope1
+        q, k = apply_rope1(q, pe), apply_rope1(k, pe)
+    return q, k
 
 
-def _to_additive_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Comfy's Qwen path normally converts integer masks before attention."""
-    if mask.dtype == torch.bool or not torch.is_floating_point(mask):
-        return (mask.to(dtype) - 1.0) * torch.finfo(dtype).max
-    return mask.to(dtype)
+def _sdpa(q, k, v, mask=None):
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
 
 
-def _get_stream_slices(
-    transformer_options: Dict[str, Any],
-    image_length: int,
-    mode: str,
-) -> Dict[str, slice]:
-    """Build image-token slices from Comfy Qwen's reference_image_num_tokens."""
-    counts = transformer_options.get("reference_image_num_tokens")
-    if not counts:
-        raise RuntimeError(
-            "OrionEdit needs Qwen ref_latents. No 'reference_image_num_tokens' "
-            "was found in transformer_options. Connect reference/source latent inputs."
-        )
-    counts = [int(x) for x in counts]
-    if any(x < 0 for x in counts):
-        raise ValueError(f"Invalid reference token lengths: {counts}")
-
-    ref_total = sum(counts)
-    syn_len = image_length - ref_total
-    if syn_len <= 0:
-        raise RuntimeError(
-            f"Invalid Qwen stream lengths: image tokens={image_length}, reference tokens={counts}."
-        )
-
+def _segments(opts, n_img, mode):
+    lengths = opts.get("reference_image_num_tokens")
+    if not lengths:
+        raise RuntimeError("OrionEdit requires Qwen ref_latents; reference_image_num_tokens is missing.")
+    lengths = [int(x) for x in lengths]
+    if any(x <= 0 for x in lengths):
+        raise RuntimeError(f"Invalid reference token lengths: {lengths}")
     if mode == "edit":
-        if len(counts) != 2:
-            raise RuntimeError(
-                "Edit mode expects exactly two ref_latents in this order: "
-                "[composited reference, source image]. For multiple references, "
-                "composite them into one reference latent first."
-            )
-        ref_len, src_len = counts
-    elif mode == "fusion":
-        if len(counts) < 2:
-            raise RuntimeError("Fusion mode expects at least two reference latents.")
-        ref_len, src_len = ref_total, 0
+        if len(lengths) != 2:
+            raise RuntimeError(f"Edit mode requires [reference, source] token lengths; got {lengths}.")
+        nr, ns = lengths
     else:
-        raise ValueError(f"Unknown OrionEdit mode: {mode}")
-
-    if syn_len + ref_len + src_len != image_length:
-        raise RuntimeError(
-            "Orion stream lengths do not match Qwen's image-token sequence: "
-            f"syn={syn_len}, ref={ref_len}, src={src_len}, total={image_length}."
-        )
-
-    return {
-        "syn": slice(0, syn_len),
-        "ref": slice(syn_len, syn_len + ref_len),
-        "src": slice(syn_len + ref_len, image_length),
-    }
+        nr, ns = sum(lengths), 0
+    nz = n_img - nr - ns
+    if nz <= 0:
+        raise RuntimeError(f"Invalid stream sizes: image tokens={n_img}, reference/source={lengths}.")
+    return slice(0, nz), slice(nz, nz + nr), slice(nz + nr, nz + nr + ns)
 
 
-def _joint_image_slices(seq_txt: int, seg: Dict[str, slice]) -> Tuple[slice, slice, slice]:
-    return tuple(
-        slice(seq_txt + seg[name].start, seq_txt + seg[name].stop)
-        for name in ("syn", "ref", "src")
-    )  # type: ignore[return-value]
+def _text_mask(x, text_mask, nt, total):
+    if text_mask is None:
+        return None
+    m = torch.zeros((x.shape[0], 1, 1, total), device=x.device, dtype=x.dtype)
+    m[..., :nt] = text_mask.reshape(x.shape[0], 1, 1, nt).to(device=x.device, dtype=x.dtype)
+    return m
 
 
-def _make_joint_mask(
-    hidden_states: torch.Tensor,
-    encoder_hidden_states_mask: Optional[torch.Tensor],
-    attention_mask: Optional[torch.Tensor],
-    seq_txt: int,
-    seq_img: int,
-) -> Optional[torch.Tensor]:
-    """Create a broadcastable additive mask, including text padding if present."""
-    batch, device, dtype = hidden_states.shape[0], hidden_states.device, hidden_states.dtype
-    total = seq_txt + seq_img
-    mask = None
-
-    if encoder_hidden_states_mask is not None:
-        txt_mask = _to_additive_mask(encoder_hidden_states_mask, dtype)
-        if txt_mask.ndim == 2:
-            txt_mask = txt_mask[:, None, None, :]
-        elif txt_mask.ndim == 3:
-            txt_mask = txt_mask[:, :, None, :]
-        key_mask = torch.zeros((batch, 1, 1, total), device=device, dtype=dtype)
-        key_mask[..., :seq_txt] = txt_mask.reshape(batch, 1, 1, seq_txt)
-        mask = key_mask
-
-    if attention_mask is not None:
-        extra = _to_additive_mask(attention_mask, dtype).to(device)
-        if extra.ndim == 2:
-            extra = extra[:, None, None, :]
-        elif extra.ndim == 3:
-            extra = extra[:, None, :, :]
-        mask = extra if mask is None else mask + extra
-
-    return mask
-
-
-def _apply_information_flow_mask(
-    mask: torch.Tensor,
-    txt: slice,
-    syn: slice,
-    ref: slice,
-    src: slice,
-    *,
-    hard: bool,
-    soft_beta: float,
-) -> None:
-    """Orion reverse-causal masking on [text | syn | ref | src]."""
-    blocked_value = torch.finfo(mask.dtype).min
-
-    def block(q: slice, k: slice) -> None:
+def _flow_mask(base, batch, total, nt, syn, ref, src, device, dtype, hard, beta):
+    m = torch.zeros((batch, 1, total, total), device=device, dtype=dtype) if base is None else base.expand(batch, 1, total, total).clone()
+    syn, ref, src = (slice(nt + s.start, nt + s.stop) for s in (syn, ref, src))
+    txt = slice(0, nt)
+    blocked = torch.finfo(dtype).min
+    def block(q, k):
         if q.start == q.stop or k.start == k.stop:
             return
         if hard:
-            mask[..., q, k] = blocked_value
+            m[:, :, q, k] = blocked
         else:
-            mask[..., q, k] -= soft_beta
-
-    # Reference queries see reference keys only.
-    block(ref, txt)
-    block(ref, syn)
+            m[:, :, q, k] -= beta
+    block(ref, txt); block(ref, syn)
     if src.stop > src.start:
         block(ref, src)
-
-    # Source queries see reference and source keys, not text or synthesis.
-    block(src, txt)
-    block(src, syn)
-    # Text and synthesis queries are intentionally unrestricted.
+    block(src, txt); block(src, syn)
+    return m
 
 
-def _run_attention(
-    attn: nn.Module,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    mask: Optional[torch.Tensor],
-    transformer_options: Dict[str, Any],
-) -> torch.Tensor:
-    q_box = AttentionTensorContainer(q)
-    k_box = AttentionTensorContainer(k)
-    v_box = AttentionTensorContainer(v)
-    out = optimized_attention_masked(
-        q_box,
-        k_box,
-        v_box,
-        attn.heads,
-        mask,
-        transformer_options=transformer_options,
-        skip_reshape=True,
-        preferred_attention=getattr(attn, "comfy_attention", None),
-    )
-    return out
-
-
-class TriOrthogonalLowRankProjector(nn.Module):
-    """Checkpoint-compatible Orion tri-subspace low-rank projector."""
-
-    def __init__(self, dim: int, rank: int):
+class _Projector(nn.Module):
+    def __init__(self, d, r):
         super().__init__()
-        # Values are overwritten by the official processor checkpoint.
-        self.A1 = nn.Parameter(torch.empty(dim, rank), requires_grad=False)
-        self.A2 = nn.Parameter(torch.empty(dim, rank), requires_grad=False)
-        self.A3 = nn.Parameter(torch.empty(dim, rank), requires_grad=False)
-        self.B1 = nn.Parameter(torch.zeros(rank, rank))
-        self.B2 = nn.Parameter(torch.zeros(rank, rank))
-        self.B3 = nn.Parameter(torch.zeros(rank, rank))
+        self.A1 = nn.Parameter(torch.empty(d, r), requires_grad=False)
+        self.A2 = nn.Parameter(torch.empty(d, r), requires_grad=False)
+        self.A3 = nn.Parameter(torch.empty(d, r), requires_grad=False)
+        self.B1 = nn.Parameter(torch.zeros(r, r))
+        self.B2 = nn.Parameter(torch.zeros(r, r))
+        self.B3 = nn.Parameter(torch.zeros(r, r))
         self.alpha = 1.0
 
     @staticmethod
-    def apply(x: torch.Tensor, A: torch.Tensor, B: torch.Tensor, alpha: float) -> torch.Tensor:
-        # ComfyUI may move patches by device without changing their dtype. Match
-        # projector tensors to the activation dtype/device before matmul.
-        A = A.to(device=x.device, dtype=x.dtype)
-        B = B.to(device=x.device, dtype=x.dtype)
-        return x + alpha * ((x @ A) @ B @ A.transpose(0, 1))
+    def apply(x, a, b, alpha):
+        a = a.to(device=x.device, dtype=x.dtype)
+        b = b.to(device=x.device, dtype=x.dtype)
+        return x + alpha * ((x @ a) @ b @ a.T)
 
 
-class OrionAttentionProcessor(nn.Module):
-    def __init__(self, stage: str, dim: int, rank: int = 256, soft_beta: float = 6.0):
+class _StageC(nn.Module):
+    def __init__(self, d, rank):
         super().__init__()
-        self.stage = stage
-        self.soft_beta = float(soft_beta)
-        self.proj = TriOrthogonalLowRankProjector(dim, rank) if stage == "C" else None
-        if stage == "C":
-            self.synthesis_fusion_logits = nn.Parameter(torch.zeros(3))
+        self.proj = _Projector(d, rank)
+        self.synthesis_fusion_logits = nn.Parameter(torch.zeros(3))
 
-    @staticmethod
-    def _project(attn, hidden_states, encoder_hidden_states):
-        b, li, _ = hidden_states.shape
-        lt = encoder_hidden_states.shape[1]
-        heads = attn.heads
-
-        # Match ComfyUI's native Qwen layout: [batch, heads, sequence, head_dim].
-        iq = attn.to_q(hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
-        ik = attn.to_k(hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
-        iv = attn.to_v(hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
-        tq = attn.add_q_proj(encoder_hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
-        tk = attn.add_k_proj(encoder_hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
-        tv = attn.add_v_proj(encoder_hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
-
-        if getattr(attn, "norm_q", None) is not None:
-            iq = attn.norm_q(iq)
-        if getattr(attn, "norm_k", None) is not None:
-            ik = attn.norm_k(ik)
-        if getattr(attn, "norm_added_q", None) is not None:
-            tq = attn.norm_added_q(tq)
-        if getattr(attn, "norm_added_k", None) is not None:
-            tk = attn.norm_added_k(tk)
-
-        # ComfyUI's native Qwen path applies RoPE to the concatenated [text|image] tensors.
-        q = torch.cat([tq, iq], dim=2)
-        k = torch.cat([tk, ik], dim=2)
-        v = torch.cat([tv, iv], dim=2)
-        return iq, ik, iv, tq, tk, tv, q, k, v, lt, li
-
-    def forward(
-        self,
-        attn: nn.Module,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_hidden_states_mask: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
-        transformer_options: Optional[Dict[str, Any]] = None,
-        mode: str = "edit",
-        block_index: int = 0,
-        **kwargs,
-    ):
-        if encoder_hidden_states is None:
-            raise RuntimeError("OrionEdit requires Qwen's text encoder_hidden_states stream.")
-        options = transformer_options or {}
-        iq, ik, iv, tq, tk, tv, q, k, v, seq_txt, seq_img = self._project(
-            attn, hidden_states, encoder_hidden_states
-        )
-
-        if image_rotary_emb is not None:
-            q = apply_rope1(q, image_rotary_emb)
-            k = apply_rope1(k, image_rotary_emb)
-
-        base_mask = _make_joint_mask(
-            hidden_states, encoder_hidden_states_mask, attention_mask, seq_txt, seq_img
-        )
-
-        seg = _get_stream_slices(options, seq_img, mode)
-        syn_j, ref_j, src_j = _joint_image_slices(seq_txt, seg)
-        txt_j = slice(0, seq_txt)
-
-        if self.stage in ("A", "B"):
-            total_len = seq_txt + seq_img
-            if base_mask is None:
-                base_mask = torch.zeros(
-                    (hidden_states.shape[0], 1, total_len, total_len),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
-            elif base_mask.shape[-2] == 1:
-                # Expand the broadcastable text-padding mask before applying
-                # query-specific Orion restrictions.
-                base_mask = base_mask.expand(-1, -1, total_len, -1).clone()
-            _apply_information_flow_mask(
-                base_mask,
-                txt_j,
-                syn_j,
-                ref_j,
-                src_j,
-                hard=(self.stage == "A"),
-                soft_beta=self.soft_beta,
-            )
-
-        joint_out = _run_attention(attn, q, k, v, base_mask, options)
-        joint_out = joint_out.to(q.dtype)
-        txt_out = joint_out[:, :seq_txt, :]
-        img_out = joint_out[:, seq_txt:, :]
-
-        if self.stage == "C":
-            assert self.proj is not None
-            # Q/K/V in [B, sequence, hidden_dim], matching the official processor.
-            # Use post-RoPE Q/K for the Stage-C branches, as the official
-            # Diffusers processor does; V remains unrotated.
-            img_q = q[:, :, seq_txt:, :].transpose(1, 2).reshape(hidden_states.shape[0], seq_img, -1)
-            img_k = k[:, :, seq_txt:, :].transpose(1, 2).reshape(hidden_states.shape[0], seq_img, -1)
-            img_v = iv.transpose(1, 2).reshape(hidden_states.shape[0], seq_img, -1)
-            txt_k = k[:, :, :seq_txt, :].transpose(1, 2).reshape(hidden_states.shape[0], seq_txt, -1)
-            txt_v = tv.transpose(1, 2).reshape(hidden_states.shape[0], seq_txt, -1)
-
-            syn, ref, src = seg["syn"], seg["ref"], seg["src"]
-            syn_len = syn.stop - syn.start
-            base_syn = img_out[:, syn, :].clone()
-            q_syn = img_q[:, syn, :]
-            k_syn, v_syn = img_k[:, syn, :], img_v[:, syn, :]
-            k_ref, v_ref = img_k[:, ref, :], img_v[:, ref, :]
-            p = self.proj
-
-            k_syn_p = p.apply(k_syn, p.A1, p.B1, p.alpha)
-            v_syn_p = p.apply(v_syn, p.A1, p.B1, p.alpha)
-            k_ref_p = p.apply(k_ref, p.A2, p.B2, p.alpha)
-            v_ref_p = p.apply(v_ref, p.A2, p.B2, p.alpha)
-            q_ref_branch = p.apply(q_syn, p.A2, p.B2, p.alpha)
-
-            if src.stop > src.start:
-                k_src = p.apply(img_k[:, src, :], p.A3, p.B3, p.alpha)
-                v_src = p.apply(img_v[:, src, :], p.A3, p.B3, p.alpha)
-                q_src_branch = p.apply(q_syn, p.A3, p.B3, p.alpha)
-                branch_k = torch.cat([txt_k, k_syn_p, k_ref_p, k_src], dim=1)
-                branch_v = torch.cat([txt_v, v_syn_p, v_ref_p, v_src], dim=1)
-                branch_q = torch.cat([q_ref_branch, q_src_branch], dim=1)
-            else:
-                q_alt = p.apply(q_syn, p.A1, p.B1, p.alpha)
-                branch_k = torch.cat([txt_k, k_syn_p, k_ref_p], dim=1)
-                branch_v = torch.cat([txt_v, v_syn_p, v_ref_p], dim=1)
-                branch_q = torch.cat([q_ref_branch, q_alt], dim=1)
-
-            heads = attn.heads
-            head_dim = branch_q.shape[-1] // heads
-            bsz = branch_q.shape[0]
-            q_branch = branch_q.view(bsz, -1, heads, head_dim).transpose(1, 2).contiguous()
-            k_branch = branch_k.view(bsz, -1, heads, head_dim).transpose(1, 2).contiguous()
-            v_branch = branch_v.view(bsz, -1, heads, head_dim).transpose(1, 2).contiguous()
-            branch_out = _run_attention(attn, q_branch, k_branch, v_branch, None, options)
-            branch_out = branch_out.to(q_branch.dtype)
-            out_ref = branch_out[:, :syn_len, :]
-            out_other = branch_out[:, syn_len : 2 * syn_len, :]
-            weights = torch.softmax(self.synthesis_fusion_logits, dim=0)
-            img_out[:, syn, :] = (
-                weights[0] * base_syn + weights[1] * out_ref + weights[2] * out_other
-            )
-
+    def forward(self, attn, x, text, text_mask, pe, opts, mode, q, k, v, tq, tk, tv):
+        if next(self.parameters()).device != x.device or next(self.parameters()).dtype != x.dtype:
+            self.to(device=x.device, dtype=x.dtype)
+        b, ni, _ = x.shape
+        nt, h = text.shape[1], attn.heads
+        total = nt + ni
+        base_mask = _text_mask(x, text_mask, nt, total)
+        base = _sdpa(q, k, v, base_mask).transpose(1, 2).reshape(b, total, -1).to(q.dtype)
+        txt_out, img_out = base[:, :nt], base[:, nt:].clone()
+        syn, ref, src = _segments(opts, ni, mode)
+        qm = q[:, :, nt:].transpose(1, 2).reshape(b, ni, -1)
+        km = k[:, :, nt:].transpose(1, 2).reshape(b, ni, -1)
+        vm = v[:, :, nt:].transpose(1, 2).reshape(b, ni, -1)
+        tkm = k[:, :, :nt].transpose(1, 2).reshape(b, nt, -1)
+        tvm = tv.transpose(1, 2).reshape(b, nt, -1)
+        p = self.proj
+        qz, kz, vz = qm[:, syn], km[:, syn], vm[:, syn]
+        kz1 = p.apply(kz, p.A1, p.B1, p.alpha); vz1 = p.apply(vz, p.A1, p.B1, p.alpha)
+        kr = p.apply(km[:, ref], p.A2, p.B2, p.alpha)
+        vr = p.apply(vm[:, ref], p.A2, p.B2, p.alpha)
+        qr = p.apply(qz, p.A2, p.B2, p.alpha)
+        if src.stop > src.start:
+            ks = p.apply(km[:, src], p.A3, p.B3, p.alpha)
+            vs = p.apply(vm[:, src], p.A3, p.B3, p.alpha)
+            qs = p.apply(qz, p.A3, p.B3, p.alpha)
+            bk, bv, bq = torch.cat((tkm, kz1, kr, ks), 1), torch.cat((tvm, vz1, vr, vs), 1), torch.cat((qr, qs), 1)
+        else:
+            qa = p.apply(qz, p.A1, p.B1, p.alpha)
+            bk, bv, bq = torch.cat((tkm, kz1, kr), 1), torch.cat((tvm, vz1, vr), 1), torch.cat((qr, qa), 1)
+        bq = bq.view(b, bq.shape[1], h, -1).transpose(1, 2).contiguous()
+        bk = bk.view(b, bk.shape[1], h, -1).transpose(1, 2).contiguous()
+        bv = bv.view(b, bv.shape[1], h, -1).transpose(1, 2).contiguous()
+        branch = _sdpa(bq, bk, bv).transpose(1, 2).reshape(b, bq.shape[2], -1).to(bq.dtype)
+        nz = syn.stop - syn.start
+        w = torch.softmax(self.synthesis_fusion_logits, dim=0)
+        img_out[:, syn] = w[0] * img_out[:, syn] + w[1] * branch[:, :nz] + w[2] * branch[:, nz:2*nz]
         img_out = attn.to_out[0](img_out)
         if len(attn.to_out) > 1:
             img_out = attn.to_out[1](img_out)
-        txt_out = attn.to_add_out(txt_out)
-        return img_out, txt_out
+        return img_out, attn.to_add_out(txt_out)
 
 
-class OrionBlockReplacement:
-    """ComfyUI patches_replace adapter; only swaps attention.forward during a block call."""
+def _attention(processor, attn, x, text, text_mask, pe, opts, mode, index):
+    if text is None:
+        raise RuntimeError("OrionEdit requires the Qwen text stream.")
+    b, ni, _ = x.shape; nt = text.shape[1]; h = attn.heads
+    iq = attn.to_q(x).view(b, ni, h, -1).transpose(1, 2).contiguous()
+    ik = attn.to_k(x).view(b, ni, h, -1).transpose(1, 2).contiguous()
+    iv = attn.to_v(x).view(b, ni, h, -1).transpose(1, 2)
+    tq = attn.add_q_proj(text).view(b, nt, h, -1).transpose(1, 2).contiguous()
+    tk = attn.add_k_proj(text).view(b, nt, h, -1).transpose(1, 2).contiguous()
+    tv = attn.add_v_proj(text).view(b, nt, h, -1).transpose(1, 2)
+    iq, ik, tq, tk = attn.norm_q(iq), attn.norm_k(ik), attn.norm_added_q(tq), attn.norm_added_k(tk)
+    q, k, v = torch.cat((tq, iq), 2), torch.cat((tk, ik), 2), torch.cat((tv, iv), 2)
+    from comfy.ldm.flux.math import apply_rope1
+    if pe is not None:
+        q, k = apply_rope1(q, pe), apply_rope1(k, pe)
+    if index >= B_END:
+        return processor(attn, x, text, text_mask, pe, opts, mode, q, k, v, tq, tk, tv)
+    syn, ref, src = _segments(opts, ni, mode)
+    base = _text_mask(x, text_mask, nt, nt + ni)
+    if index < A_END:
+        mask = _flow_mask(base, b, nt + ni, nt, syn, ref, src, x.device, x.dtype, True, 0.0)
+    else:
+        beta = 8.0 - 6.0 * ((index - A_END) / (B_END - A_END - 1))
+        mask = _flow_mask(base, b, nt + ni, nt, syn, ref, src, x.device, x.dtype, False, beta)
+    out = _sdpa(q, k, v, mask).transpose(1, 2).reshape(b, nt + ni, -1).to(q.dtype)
+    txt_out, img_out = out[:, :nt], out[:, nt:]
+    img_out = attn.to_out[0](img_out)
+    if len(attn.to_out) > 1:
+        img_out = attn.to_out[1](img_out)
+    return img_out, attn.to_add_out(txt_out)
 
-    def __init__(self, attn, processor, mode: str, block_index: int, previous=None):
-        self.attn = attn
-        self.processor = processor
-        self.mode = mode
-        self.block_index = int(block_index)
-        self.previous = previous
 
-    def __call__(self, args, extra_args):
-        original_forward = self.attn.forward
-        processor = self.processor
-        mode = self.mode
-        block_index = self.block_index
+class _BlockPatch:
+    def __init__(self, block, processor, mode, index, previous=None):
+        self.block, self.processor, self.mode, self.index, self.previous = block, processor, mode, index, previous
 
-        def orion_forward(
-            _attn,
-            hidden_states,
-            encoder_hidden_states=None,
-            encoder_hidden_states_mask=None,
-            attention_mask=None,
-            image_rotary_emb=None,
-            transformer_options=None,
-            **kwargs,
-        ):
-            return processor(
-                _attn,
-                hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_hidden_states_mask=encoder_hidden_states_mask,
-                attention_mask=attention_mask,
-                image_rotary_emb=image_rotary_emb,
-                transformer_options=transformer_options,
-                mode=mode,
-                block_index=block_index,
-                **kwargs,
-            )
-
-        with _PATCH_LOCK:
-            self.attn.forward = types.MethodType(orion_forward, self.attn)
-            try:
-                if self.previous is not None:
-                    return self.previous(args, extra_args)
-                return extra_args["original_block"](args)
-            finally:
-                self.attn.forward = original_forward
+    def __call__(self, args, extra):
+        attn = self.block.attn
+        original = attn.forward
+        def patched_forward(hidden_states, encoder_hidden_states=None, encoder_hidden_states_mask=None,
+                            attention_mask=None, image_rotary_emb=None, transformer_options=None, **kwargs):
+            return _attention(self.processor, attn, hidden_states, encoder_hidden_states,
+                              encoder_hidden_states_mask, image_rotary_emb, transformer_options or {},
+                              self.mode, self.index)
+        attn.forward = patched_forward
+        try:
+            return self.previous(args, extra) if self.previous is not None else extra["original_block"](args)
+        finally:
+            attn.forward = original
 
     def to(self, device_or_dtype):
-        self.processor.to(device_or_dtype)
+        if isinstance(self.processor, nn.Module):
+            self.processor.to(device_or_dtype)
         if self.previous is not None and hasattr(self.previous, "to"):
-            self.previous = self.previous.to(device_or_dtype)
+            self.previous.to(device_or_dtype)
         return self
-
-    def models(self):
-        if self.previous is not None and hasattr(self.previous, "models"):
-            return self.previous.models()
-        return []
 
     def cleanup(self):
         if self.previous is not None and hasattr(self.previous, "cleanup"):
             self.previous.cleanup()
 
-
-def _find_diffusion_model(model):
-    if hasattr(model, "get_model_object"):
-        for path in ("diffusion_model", "model.diffusion_model"):
-            try:
-                obj = model.get_model_object(path)
-                if obj is not None:
-                    return obj
-            except Exception:
-                pass
-    base = getattr(model, "model", None)
-    return getattr(base, "diffusion_model", None)
-
-
-def _extract_layer_state(state: Dict[str, torch.Tensor], block_index: int) -> Dict[str, torch.Tensor]:
-    marker = f"transformer_blocks.{block_index}.attn.processor."
-    result = {}
-    for key, value in state.items():
-        pos = key.find(marker)
-        if pos >= 0:
-            name = key[pos + len(marker) :]
-            # Keep only the decoupling processor parameters.
-            if name in {
-                "proj.A1", "proj.A2", "proj.A3",
-                "proj.B1", "proj.B2", "proj.B3",
-                "synthesis_fusion_logits",
-            }:
-                result[name] = value
-    return result
+    def models(self):
+        return self.previous.models() if self.previous is not None and hasattr(self.previous, "models") else []
 
 
 class ApplyOrionEditAttention:
     @classmethod
     def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "processor_weights": ("STRING", {"default": "", "multiline": False}),
-                "mode": (["edit", "fusion"], {"default": "edit"}),
-            }
-        }
+        return {"required": {
+            "model": ("MODEL",),
+            "mode": (["edit", "fusion"], {"default": "edit"}),
+            "processor_weights": ("STRING", {"default": "orionedit/pytorch_processor_weights.safetensors"}),
+        }}
 
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "apply"
     CATEGORY = "OrionEdit"
 
-    def apply(self, model, processor_weights: str, mode: str = "edit"):
-        path = os.path.expanduser(os.path.expandvars(processor_weights.strip()))
-        if not path or not os.path.isfile(path):
-            raise FileNotFoundError(f"OrionEdit processor checkpoint not found: {path!r}")
-
-        diffusion_model = _find_diffusion_model(model)
-        blocks = getattr(diffusion_model, "transformer_blocks", None)
-        if blocks is None:
-            raise RuntimeError(
-                "This node supports ComfyUI's native QwenImageTransformer2DModel "
-                "with diffusion_model.transformer_blocks."
-            )
-        if len(blocks) != _TOTAL_BLOCKS:
-            raise RuntimeError(f"Expected 60 Qwen transformer blocks, found {len(blocks)}.")
-
+    def apply(self, model, mode, processor_weights):
+        if not hasattr(model, "clone") or not hasattr(model, "set_model_patch_replace"):
+            raise TypeError("Expected a ComfyUI MODEL patcher input.")
+        path = processor_weights.strip()
+        if not os.path.isabs(path):
+            path = os.path.join(folder_paths.models_dir, path)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"OrionEdit processor weights not found: {path}")
         state = load_file(path, device="cpu")
         patched = model.clone()
-        existing = (
-            patched.model_options.get("transformer_options", {})
-            .get("patches_replace", {})
-            .get("dit", {})
-        )
-
-        for index, block in enumerate(blocks):
+        diffusion_model = patched.get_model_object("diffusion_model")
+        blocks = getattr(diffusion_model, "transformer_blocks", None)
+        if blocks is None or len(blocks) != N_BLOCKS:
+            raise RuntimeError(f"Expected the 60-block Qwen Image Edit transformer; found {len(blocks) if blocks is not None else 0} blocks.")
+        replacements = patched.model_options.get("transformer_options", {}).get("patches_replace", {}).get("dit", {})
+        for i, block in enumerate(blocks):
             attn = getattr(block, "attn", None)
-            if attn is None:
-                raise RuntimeError(f"Qwen block {index} has no .attn module.")
-            dim = int(getattr(attn, "inner_dim", attn.heads * attn.dim_head))
-
-            if index < _STAGE_A_END:
-                processor = OrionAttentionProcessor("A", dim)
-            elif index < _STAGE_B_END:
-                beta = 8.0 - 6.0 * ((index - _STAGE_A_END) / max(_STAGE_B_END - _STAGE_A_END - 1, 1))
-                processor = OrionAttentionProcessor("B", dim, soft_beta=beta)
-            else:
-                layer_state = _extract_layer_state(state, index)
-                required = {
-                    "proj.A1", "proj.A2", "proj.A3",
-                    "proj.B1", "proj.B2", "proj.B3",
-                    "synthesis_fusion_logits",
-                }
-                missing = required.difference(layer_state)
+            if attn is None or not hasattr(attn, "to_q") or not hasattr(attn, "add_q_proj"):
+                raise RuntimeError(f"Block {i} is not the expected Qwen double-stream attention block.")
+            processor = None
+            if i >= B_END:
+                prefix = f"transformer.transformer_blocks.{i}.attn.processor."
+                sd = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+                required = {"proj.A1", "proj.A2", "proj.A3", "proj.B1", "proj.B2", "proj.B3", "synthesis_fusion_logits"}
+                missing = required - set(sd)
                 if missing:
-                    raise RuntimeError(
-                        f"Processor checkpoint is missing block {index} parameters: {sorted(missing)}"
-                    )
-                rank = int(layer_state["proj.A1"].shape[1])
-                if int(layer_state["proj.A1"].shape[0]) != dim:
-                    raise RuntimeError(
-                        f"Block {index} projector dimension {layer_state['proj.A1'].shape[0]} "
-                        f"does not match Qwen attention dimension {dim}."
-                    )
-                processor = OrionAttentionProcessor("C", dim, rank=rank)
-                processor.load_state_dict(layer_state, strict=True)
-
-            previous = existing.get(("double_block", index))
-            patch = OrionBlockReplacement(attn, processor, mode, index, previous)
-            patched.set_model_patch_replace(patch, "dit", "double_block", index)
-
+                    raise RuntimeError(f"Missing Stage C weights for block {i}: {sorted(missing)}")
+                rank, d = int(sd["proj.B1"].shape[0]), int(sd["proj.A1"].shape[0])
+                model_d = int(getattr(attn, "inner_dim", attn.heads * attn.dim_head))
+                if d != model_d:
+                    raise RuntimeError(f"Stage C dimension mismatch at block {i}: checkpoint {d}, model {model_d}.")
+                processor = _StageC(d, rank)
+                processor.load_state_dict(sd, strict=True)
+            key = ("double_block", i)
+            previous = replacements.get(key)
+            if isinstance(previous, _BlockPatch):
+                raise RuntimeError("OrionEdit attention is already applied to this model.")
+            patched.set_model_patch_replace(_BlockPatch(block, processor, mode, i, previous), "dit", "double_block", i)
         return (patched,)
+
 
 # ==========================================
 # Custom Node 2: OrionEdit helper
