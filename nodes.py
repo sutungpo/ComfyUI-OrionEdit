@@ -1,357 +1,549 @@
+# ==========================================
+# Custom Node 1: OrionEdit ApplyOrionEditAttention
+# ==========================================
+"""OrionEdit attention adapter for ComfyUI Qwen Image Edit 2511.
+
+This node patches only the attention execution of the existing Qwen double-stream
+blocks. The original projection modules (including INT8/ConvRot implementations)
+remain owned and executed by ComfyUI.
+
+Install this folder under ComfyUI/custom_nodes/ComfyUI_OrionEdit/.
+"""
+
+from __future__ import annotations
+
 import os
-import math
+import threading
+import types
+from typing import Any, Dict, Optional, Tuple
+
 import torch
-import numpy as np
-from PIL import Image
-from safetensors.torch import load_file as load_sft
+import torch.nn as nn
 
-import folder_paths
-import comfy.utils
-import comfy.sd
-
-# Register custom model subfolder for processor weights
-if "processors" not in folder_paths.folder_names_and_paths:
-    folder_paths.add_model_folder_path(
-        "processors", os.path.join(folder_paths.models_dir, "processors")
-    )
-
-# Resilient import: works whether transformer_orion.py is in the root or a models/ subfolder
 try:
-    from .transformer_orion import set_orion_block_processors
-except ImportError:
-    from .models.transformer_orion import set_orion_block_processors
+    from safetensors.torch import load_file
+    from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention_masked
+    from comfy.ldm.flux.math import apply_rope1
+except Exception as exc:  # pragma: no cover - import error is reported by ComfyUI
+    raise ImportError(
+        "ComfyUI_OrionEdit must be installed inside ComfyUI and requires safetensors."
+    ) from exc
 
 
-# ==========================================
-# Mathematical Latent Packing Helpers
-# ==========================================
-
-def _pack_latents_2d(latents: torch.Tensor) -> torch.Tensor:
-    """Pack [B, C, H, W] or [B, C, 1, H, W] -> [B, (H//2)*(W//2), C*4]."""
-    # Handle 5D spatio-temporal latents from Qwen-Image 3D VAE
-    if latents.ndim == 5:
-        if latents.shape[2] == 1:
-            latents = latents.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
-        elif latents.shape[1] == 1:
-            latents = latents.squeeze(1)  # [B, 1, C, H, W] -> [B, C, H, W]
-        else:
-            latents = latents[:, :, 0, :, :]
-
-    B, C, H, W = latents.shape
-    x = latents.view(B, C, H // 2, 2, W // 2, 2)
-    x = x.permute(0, 2, 4, 1, 3, 5)
-    return x.reshape(B, (H // 2) * (W // 2), C * 4)
+_STAGE_A_END = 20
+_STAGE_B_END = 40
+_TOTAL_BLOCKS = 60
+_PATCH_LOCK = threading.RLock()
 
 
-def _unpack_latents_2d(packed: torch.Tensor, H: int, W: int, C: int = 16) -> torch.Tensor:
-    """Unpack [B, (H//2)*(W//2), C*4] -> [B, C, H, W]."""
-    B, L, D = packed.shape
-    x = packed.view(B, H // 2, W // 2, C, 2, 2)
-    x = x.permute(0, 3, 1, 4, 2, 5)
-    return x.reshape(B, C, H, W)
+def _to_additive_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Comfy's Qwen path normally converts integer masks before attention."""
+    if mask.dtype == torch.bool or not torch.is_floating_point(mask):
+        return (mask.to(dtype) - 1.0) * torch.finfo(dtype).max
+    return mask.to(dtype)
 
 
-def calculate_dimensions(target_area: int, ratio: float):
-    width = math.sqrt(target_area * ratio)
-    height = width / ratio
-    width = round(width / 32) * 32
-    height = round(height / 32) * 32
-    return int(width), int(height)
+def _get_stream_slices(
+    transformer_options: Dict[str, Any],
+    image_length: int,
+    mode: str,
+) -> Dict[str, slice]:
+    """Build image-token slices from Comfy Qwen's reference_image_num_tokens."""
+    counts = transformer_options.get("reference_image_num_tokens")
+    if not counts:
+        raise RuntimeError(
+            "OrionEdit needs Qwen ref_latents. No 'reference_image_num_tokens' "
+            "was found in transformer_options. Connect reference/source latent inputs."
+        )
+    counts = [int(x) for x in counts]
+    if any(x < 0 for x in counts):
+        raise ValueError(f"Invalid reference token lengths: {counts}")
 
+    ref_total = sum(counts)
+    syn_len = image_length - ref_total
+    if syn_len <= 0:
+        raise RuntimeError(
+            f"Invalid Qwen stream lengths: image tokens={image_length}, reference tokens={counts}."
+        )
 
-def _build_composited_reference_canvas(refs, source):
-    if len(refs) == 1:
-        return refs[0]
-    strip_w = sum(r.width for r in refs)
-    strip_h = max(r.height for r in refs)
-    strip = Image.new("RGB", (strip_w, strip_h), (0, 0, 0))
-    x = 0
-    for ref in refs:
-        strip.paste(ref, (x, 0))
-        x += ref.width
+    if mode == "edit":
+        if len(counts) != 2:
+            raise RuntimeError(
+                "Edit mode expects exactly two ref_latents in this order: "
+                "[composited reference, source image]. For multiple references, "
+                "composite them into one reference latent first."
+            )
+        ref_len, src_len = counts
+    elif mode == "fusion":
+        if len(counts) < 2:
+            raise RuntimeError("Fusion mode expects at least two reference latents.")
+        ref_len, src_len = ref_total, 0
+    else:
+        raise ValueError(f"Unknown OrionEdit mode: {mode}")
 
-    canvas_w, canvas_h = source.size if source is not None else refs[0].size
-    scale = min(canvas_w / strip_w, canvas_h / strip_h)
-    new_w = max(1, int(round(strip_w * scale)))
-    new_h = max(1, int(round(strip_h * scale)))
-    resized_strip = strip.resize((new_w, new_h), Image.BICUBIC)
+    if syn_len + ref_len + src_len != image_length:
+        raise RuntimeError(
+            "Orion stream lengths do not match Qwen's image-token sequence: "
+            f"syn={syn_len}, ref={ref_len}, src={src_len}, total={image_length}."
+        )
 
-    canvas = Image.new("RGB", (canvas_w, canvas_h), (0, 0, 0))
-    canvas.paste(resized_strip, ((canvas_w - new_w) // 2, (canvas_h - new_h) // 2))
-    return canvas
-
-
-def build_image_stream_slices(L_syn: int, L_ref: int, L_src: int, start_offset: int = 0):
     return {
-        "syn": slice(start_offset, start_offset + L_syn),
-        "ref": slice(start_offset + L_syn, start_offset + L_syn + L_ref),
-        "src": slice(start_offset + L_syn + L_ref, start_offset + L_syn + L_ref + L_src),
+        "syn": slice(0, syn_len),
+        "ref": slice(syn_len, syn_len + ref_len),
+        "src": slice(syn_len + ref_len, image_length),
     }
 
 
-def build_dns_seg_slices(L_syn: int, packed_lengths, has_source: bool):
-    lengths = list(packed_lengths)
-    if not has_source:
-        return build_image_stream_slices(L_syn, sum(lengths), 0)
-    return build_image_stream_slices(L_syn, lengths[0], lengths[1])
+def _joint_image_slices(seq_txt: int, seg: Dict[str, slice]) -> Tuple[slice, slice, slice]:
+    return tuple(
+        slice(seq_txt + seg[name].start, seq_txt + seg[name].stop)
+        for name in ("syn", "ref", "src")
+    )  # type: ignore[return-value]
 
 
-# ==========================================
-# Custom Node 1: Apply OrionEdit Patcher
-# ==========================================
+def _make_joint_mask(
+    hidden_states: torch.Tensor,
+    encoder_hidden_states_mask: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    seq_txt: int,
+    seq_img: int,
+) -> Optional[torch.Tensor]:
+    """Create a broadcastable additive mask, including text padding if present."""
+    batch, device, dtype = hidden_states.shape[0], hidden_states.device, hidden_states.dtype
+    total = seq_txt + seq_img
+    mask = None
 
-class ApplyOrionEditPatcher:
+    if encoder_hidden_states_mask is not None:
+        txt_mask = _to_additive_mask(encoder_hidden_states_mask, dtype)
+        if txt_mask.ndim == 2:
+            txt_mask = txt_mask[:, None, None, :]
+        elif txt_mask.ndim == 3:
+            txt_mask = txt_mask[:, :, None, :]
+        key_mask = torch.zeros((batch, 1, 1, total), device=device, dtype=dtype)
+        key_mask[..., :seq_txt] = txt_mask.reshape(batch, 1, 1, seq_txt)
+        mask = key_mask
+
+    if attention_mask is not None:
+        extra = _to_additive_mask(attention_mask, dtype).to(device)
+        if extra.ndim == 2:
+            extra = extra[:, None, None, :]
+        elif extra.ndim == 3:
+            extra = extra[:, None, :, :]
+        mask = extra if mask is None else mask + extra
+
+    return mask
+
+
+def _apply_information_flow_mask(
+    mask: torch.Tensor,
+    txt: slice,
+    syn: slice,
+    ref: slice,
+    src: slice,
+    *,
+    hard: bool,
+    soft_beta: float,
+) -> None:
+    """Orion reverse-causal masking on [text | syn | ref | src]."""
+    blocked_value = torch.finfo(mask.dtype).min
+
+    def block(q: slice, k: slice) -> None:
+        if q.start == q.stop or k.start == k.stop:
+            return
+        if hard:
+            mask[..., q, k] = blocked_value
+        else:
+            mask[..., q, k] -= soft_beta
+
+    # Reference queries see reference keys only.
+    block(ref, txt)
+    block(ref, syn)
+    if src.stop > src.start:
+        block(ref, src)
+
+    # Source queries see reference and source keys, not text or synthesis.
+    block(src, txt)
+    block(src, syn)
+    # Text and synthesis queries are intentionally unrestricted.
+
+
+def _run_attention(
+    attn: nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: Optional[torch.Tensor],
+    transformer_options: Dict[str, Any],
+) -> torch.Tensor:
+    q_box = AttentionTensorContainer(q)
+    k_box = AttentionTensorContainer(k)
+    v_box = AttentionTensorContainer(v)
+    out = optimized_attention_masked(
+        q_box,
+        k_box,
+        v_box,
+        attn.heads,
+        mask,
+        transformer_options=transformer_options,
+        skip_reshape=True,
+        preferred_attention=getattr(attn, "comfy_attention", None),
+    )
+    return out
+
+
+class TriOrthogonalLowRankProjector(nn.Module):
+    """Checkpoint-compatible Orion tri-subspace low-rank projector."""
+
+    def __init__(self, dim: int, rank: int):
+        super().__init__()
+        # Values are overwritten by the official processor checkpoint.
+        self.A1 = nn.Parameter(torch.empty(dim, rank), requires_grad=False)
+        self.A2 = nn.Parameter(torch.empty(dim, rank), requires_grad=False)
+        self.A3 = nn.Parameter(torch.empty(dim, rank), requires_grad=False)
+        self.B1 = nn.Parameter(torch.zeros(rank, rank))
+        self.B2 = nn.Parameter(torch.zeros(rank, rank))
+        self.B3 = nn.Parameter(torch.zeros(rank, rank))
+        self.alpha = 1.0
+
+    @staticmethod
+    def apply(x: torch.Tensor, A: torch.Tensor, B: torch.Tensor, alpha: float) -> torch.Tensor:
+        # ComfyUI may move patches by device without changing their dtype. Match
+        # projector tensors to the activation dtype/device before matmul.
+        A = A.to(device=x.device, dtype=x.dtype)
+        B = B.to(device=x.device, dtype=x.dtype)
+        return x + alpha * ((x @ A) @ B @ A.transpose(0, 1))
+
+
+class OrionAttentionProcessor(nn.Module):
+    def __init__(self, stage: str, dim: int, rank: int = 256, soft_beta: float = 6.0):
+        super().__init__()
+        self.stage = stage
+        self.soft_beta = float(soft_beta)
+        self.proj = TriOrthogonalLowRankProjector(dim, rank) if stage == "C" else None
+        if stage == "C":
+            self.synthesis_fusion_logits = nn.Parameter(torch.zeros(3))
+
+    @staticmethod
+    def _project(attn, hidden_states, encoder_hidden_states):
+        b, li, _ = hidden_states.shape
+        lt = encoder_hidden_states.shape[1]
+        heads = attn.heads
+
+        # Match ComfyUI's native Qwen layout: [batch, heads, sequence, head_dim].
+        iq = attn.to_q(hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
+        ik = attn.to_k(hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
+        iv = attn.to_v(hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
+        tq = attn.add_q_proj(encoder_hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
+        tk = attn.add_k_proj(encoder_hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
+        tv = attn.add_v_proj(encoder_hidden_states).unflatten(-1, (heads, -1)).transpose(1, 2).contiguous()
+
+        if getattr(attn, "norm_q", None) is not None:
+            iq = attn.norm_q(iq)
+        if getattr(attn, "norm_k", None) is not None:
+            ik = attn.norm_k(ik)
+        if getattr(attn, "norm_added_q", None) is not None:
+            tq = attn.norm_added_q(tq)
+        if getattr(attn, "norm_added_k", None) is not None:
+            tk = attn.norm_added_k(tk)
+
+        # ComfyUI's native Qwen path applies RoPE to the concatenated [text|image] tensors.
+        q = torch.cat([tq, iq], dim=2)
+        k = torch.cat([tk, ik], dim=2)
+        v = torch.cat([tv, iv], dim=2)
+        return iq, ik, iv, tq, tk, tv, q, k, v, lt, li
+
+    def forward(
+        self,
+        attn: nn.Module,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_hidden_states_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        transformer_options: Optional[Dict[str, Any]] = None,
+        mode: str = "edit",
+        block_index: int = 0,
+        **kwargs,
+    ):
+        if encoder_hidden_states is None:
+            raise RuntimeError("OrionEdit requires Qwen's text encoder_hidden_states stream.")
+        options = transformer_options or {}
+        iq, ik, iv, tq, tk, tv, q, k, v, seq_txt, seq_img = self._project(
+            attn, hidden_states, encoder_hidden_states
+        )
+
+        if image_rotary_emb is not None:
+            q = apply_rope1(q, image_rotary_emb)
+            k = apply_rope1(k, image_rotary_emb)
+
+        base_mask = _make_joint_mask(
+            hidden_states, encoder_hidden_states_mask, attention_mask, seq_txt, seq_img
+        )
+
+        seg = _get_stream_slices(options, seq_img, mode)
+        syn_j, ref_j, src_j = _joint_image_slices(seq_txt, seg)
+        txt_j = slice(0, seq_txt)
+
+        if self.stage in ("A", "B"):
+            total_len = seq_txt + seq_img
+            if base_mask is None:
+                base_mask = torch.zeros(
+                    (hidden_states.shape[0], 1, total_len, total_len),
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            elif base_mask.shape[-2] == 1:
+                # Expand the broadcastable text-padding mask before applying
+                # query-specific Orion restrictions.
+                base_mask = base_mask.expand(-1, -1, total_len, -1).clone()
+            _apply_information_flow_mask(
+                base_mask,
+                txt_j,
+                syn_j,
+                ref_j,
+                src_j,
+                hard=(self.stage == "A"),
+                soft_beta=self.soft_beta,
+            )
+
+        joint_out = _run_attention(attn, q, k, v, base_mask, options)
+        joint_out = joint_out.to(q.dtype)
+        txt_out = joint_out[:, :seq_txt, :]
+        img_out = joint_out[:, seq_txt:, :]
+
+        if self.stage == "C":
+            assert self.proj is not None
+            # Q/K/V in [B, sequence, hidden_dim], matching the official processor.
+            # Use post-RoPE Q/K for the Stage-C branches, as the official
+            # Diffusers processor does; V remains unrotated.
+            img_q = q[:, :, seq_txt:, :].transpose(1, 2).reshape(hidden_states.shape[0], seq_img, -1)
+            img_k = k[:, :, seq_txt:, :].transpose(1, 2).reshape(hidden_states.shape[0], seq_img, -1)
+            img_v = iv.transpose(1, 2).reshape(hidden_states.shape[0], seq_img, -1)
+            txt_k = k[:, :, :seq_txt, :].transpose(1, 2).reshape(hidden_states.shape[0], seq_txt, -1)
+            txt_v = tv.transpose(1, 2).reshape(hidden_states.shape[0], seq_txt, -1)
+
+            syn, ref, src = seg["syn"], seg["ref"], seg["src"]
+            syn_len = syn.stop - syn.start
+            base_syn = img_out[:, syn, :].clone()
+            q_syn = img_q[:, syn, :]
+            k_syn, v_syn = img_k[:, syn, :], img_v[:, syn, :]
+            k_ref, v_ref = img_k[:, ref, :], img_v[:, ref, :]
+            p = self.proj
+
+            k_syn_p = p.apply(k_syn, p.A1, p.B1, p.alpha)
+            v_syn_p = p.apply(v_syn, p.A1, p.B1, p.alpha)
+            k_ref_p = p.apply(k_ref, p.A2, p.B2, p.alpha)
+            v_ref_p = p.apply(v_ref, p.A2, p.B2, p.alpha)
+            q_ref_branch = p.apply(q_syn, p.A2, p.B2, p.alpha)
+
+            if src.stop > src.start:
+                k_src = p.apply(img_k[:, src, :], p.A3, p.B3, p.alpha)
+                v_src = p.apply(img_v[:, src, :], p.A3, p.B3, p.alpha)
+                q_src_branch = p.apply(q_syn, p.A3, p.B3, p.alpha)
+                branch_k = torch.cat([txt_k, k_syn_p, k_ref_p, k_src], dim=1)
+                branch_v = torch.cat([txt_v, v_syn_p, v_ref_p, v_src], dim=1)
+                branch_q = torch.cat([q_ref_branch, q_src_branch], dim=1)
+            else:
+                q_alt = p.apply(q_syn, p.A1, p.B1, p.alpha)
+                branch_k = torch.cat([txt_k, k_syn_p, k_ref_p], dim=1)
+                branch_v = torch.cat([txt_v, v_syn_p, v_ref_p], dim=1)
+                branch_q = torch.cat([q_ref_branch, q_alt], dim=1)
+
+            heads = attn.heads
+            head_dim = branch_q.shape[-1] // heads
+            bsz = branch_q.shape[0]
+            q_branch = branch_q.view(bsz, -1, heads, head_dim).transpose(1, 2).contiguous()
+            k_branch = branch_k.view(bsz, -1, heads, head_dim).transpose(1, 2).contiguous()
+            v_branch = branch_v.view(bsz, -1, heads, head_dim).transpose(1, 2).contiguous()
+            branch_out = _run_attention(attn, q_branch, k_branch, v_branch, None, options)
+            branch_out = branch_out.to(q_branch.dtype)
+            out_ref = branch_out[:, :syn_len, :]
+            out_other = branch_out[:, syn_len : 2 * syn_len, :]
+            weights = torch.softmax(self.synthesis_fusion_logits, dim=0)
+            img_out[:, syn, :] = (
+                weights[0] * base_syn + weights[1] * out_ref + weights[2] * out_other
+            )
+
+        img_out = attn.to_out[0](img_out)
+        if len(attn.to_out) > 1:
+            img_out = attn.to_out[1](img_out)
+        txt_out = attn.to_add_out(txt_out)
+        return img_out, txt_out
+
+
+class OrionBlockReplacement:
+    """ComfyUI patches_replace adapter; only swaps attention.forward during a block call."""
+
+    def __init__(self, attn, processor, mode: str, block_index: int, previous=None):
+        self.attn = attn
+        self.processor = processor
+        self.mode = mode
+        self.block_index = int(block_index)
+        self.previous = previous
+
+    def __call__(self, args, extra_args):
+        original_forward = self.attn.forward
+        processor = self.processor
+        mode = self.mode
+        block_index = self.block_index
+
+        def orion_forward(
+            _attn,
+            hidden_states,
+            encoder_hidden_states=None,
+            encoder_hidden_states_mask=None,
+            attention_mask=None,
+            image_rotary_emb=None,
+            transformer_options=None,
+            **kwargs,
+        ):
+            return processor(
+                _attn,
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                attention_mask=attention_mask,
+                image_rotary_emb=image_rotary_emb,
+                transformer_options=transformer_options,
+                mode=mode,
+                block_index=block_index,
+                **kwargs,
+            )
+
+        with _PATCH_LOCK:
+            self.attn.forward = types.MethodType(orion_forward, self.attn)
+            try:
+                if self.previous is not None:
+                    return self.previous(args, extra_args)
+                return extra_args["original_block"](args)
+            finally:
+                self.attn.forward = original_forward
+
+    def to(self, device_or_dtype):
+        self.processor.to(device_or_dtype)
+        if self.previous is not None and hasattr(self.previous, "to"):
+            self.previous = self.previous.to(device_or_dtype)
+        return self
+
+    def models(self):
+        if self.previous is not None and hasattr(self.previous, "models"):
+            return self.previous.models()
+        return []
+
+    def cleanup(self):
+        if self.previous is not None and hasattr(self.previous, "cleanup"):
+            self.previous.cleanup()
+
+
+def _find_diffusion_model(model):
+    if hasattr(model, "get_model_object"):
+        for path in ("diffusion_model", "model.diffusion_model"):
+            try:
+                obj = model.get_model_object(path)
+                if obj is not None:
+                    return obj
+            except Exception:
+                pass
+    base = getattr(model, "model", None)
+    return getattr(base, "diffusion_model", None)
+
+
+def _extract_layer_state(state: Dict[str, torch.Tensor], block_index: int) -> Dict[str, torch.Tensor]:
+    marker = f"transformer_blocks.{block_index}.attn.processor."
+    result = {}
+    for key, value in state.items():
+        pos = key.find(marker)
+        if pos >= 0:
+            name = key[pos + len(marker) :]
+            # Keep only the decoupling processor parameters.
+            if name in {
+                "proj.A1", "proj.A2", "proj.A3",
+                "proj.B1", "proj.B2", "proj.B3",
+                "synthesis_fusion_logits",
+            }:
+                result[name] = value
+    return result
+
+
+class ApplyOrionEditAttention:
     @classmethod
-    def INPUT_TYPES(s):
-        proc_files = folder_paths.get_filename_list("processors")
-        if not proc_files:
-            # Fallback scan in loras directory if user placed it there
-            proc_files = [f for f in folder_paths.get_filename_list("loras") if "proc" in f.lower()]
-        proc_list = proc_files if proc_files else ["None"]
-
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "model": ("MODEL",),
-                "processor_name": (proc_list,),
-                "lora_name": (["None"] + folder_paths.get_filename_list("loras"),),
-                "soft_beta": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 20.0, "step": 0.5}),
-                "lora_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.05}),
+                "processor_weights": ("STRING", {"default": "", "multiline": False}),
+                "mode": (["edit", "fusion"], {"default": "edit"}),
             }
         }
 
     RETURN_TYPES = ("MODEL",)
-    FUNCTION = "apply_patcher"
+    RETURN_NAMES = ("model",)
+    FUNCTION = "apply"
     CATEGORY = "OrionEdit"
 
-    def apply_patcher(self, model, processor_name, lora_name, soft_beta, lora_strength):
-        print(f"\n[OrionEdit] Initializing ApplyOrionEditPatcher...")
-        # 1. Strictly adhere to ComfyUI contract: clone ModelPatcher
-        model = model.clone()
+    def apply(self, model, processor_weights: str, mode: str = "edit"):
+        path = os.path.expanduser(os.path.expandvars(processor_weights.strip()))
+        if not path or not os.path.isfile(path):
+            raise FileNotFoundError(f"OrionEdit processor checkpoint not found: {path!r}")
 
-        # 2. Apply LoRA on quantized/int8 model in RAM via native ModelPatcher
-        if lora_name != "None":
-            lora_path = folder_paths.get_full_path("loras", lora_name)
-            if lora_path and os.path.exists(lora_path):
-                print(f"[OrionEdit] Loading LoRA: {lora_name} (strength: {lora_strength})")
-                lora_weights = comfy.utils.load_torch_file(lora_path)
-                model, _ = comfy.sd.load_lora_for_models(model, None, lora_weights, lora_strength, 0)
-                print(f"[OrionEdit] LoRA successfully patched to model.")
-            else:
-                print(f"[OrionEdit Warning] LoRA file not found: {lora_name}")
-
-        # 3. Inject Orion Attention Processors onto Diffusion Transformer
-        target_model = getattr(model.model, "diffusion_model", model.model)
-        print(f"[OrionEdit] Installing 3-stage processors across 60 transformer layers...")
-        set_orion_block_processors(target_model, d=3072, rank=256, use_gate=False)
-
-        # 4. Safely load Tri-Orthogonal processor weights directly into the processors
-        if processor_name != "None":
-            proc_path = folder_paths.get_full_path("processors", processor_name)
-            if not proc_path:
-                proc_path = folder_paths.get_full_path("loras", processor_name)
-
-            if proc_path and os.path.exists(proc_path):
-                print(f"[OrionEdit] Loading processor weights from: {proc_path}")
-                state = load_sft(proc_path, device="cpu")
-                
-                # Group keys by block index: transformer_blocks.{i}.attn.processor...
-                loaded_count = 0
-                for bi, blk in enumerate(target_model.transformer_blocks):
-                    proc = getattr(blk.attn, "processor", None)
-                    if proc is not None and hasattr(proc, "state_dict"):
-                        prefix_candidates = [
-                            f"transformer.transformer_blocks.{bi}.attn.processor.",
-                            f"transformer_blocks.{bi}.attn.processor.",
-                            f"diffusion_model.transformer_blocks.{bi}.attn.processor.",
-                        ]
-                        proc_sd = {}
-                        for k, v in state.items():
-                            for pfx in prefix_candidates:
-                                if k.startswith(pfx):
-                                    sub_key = k[len(pfx):]
-                                    proc_sd[sub_key] = v
-                                    break
-                        if proc_sd:
-                            proc.load_state_dict(proc_sd, strict=False)
-                            loaded_count += len(proc_sd)
-
-                print(f"[OrionEdit] Successfully injected {loaded_count} processor tensors into attention blocks.")
-            else:
-                print(f"[OrionEdit Warning] Processor file not found: {processor_name}")
-
-        # 5. Intercept KSampler execution via native function wrapper
-        def orion_unet_wrapper(apply_model, args):
-            latent_in = args["input"]
-            c = args["c"]
-            transformer_options = c.get("transformer_options", {})
-            
-            # Check multiple standard ComfyUI locations where cond metadata might live
-            cond_orion = c.get("orion_cond", None)
-            if cond_orion is None and "transformer_options" in c:
-                cond_orion = c["transformer_options"].get("orion_cond", None)
-
-            # If this is purely unconditional and Orion cond is absent, proceed normally
-            if cond_orion is None:
-                return apply_model(latent_in, args["timestep"], **c)
-
-            ref_latents = cond_orion["ref_latents"]
-            seg_slices_img = cond_orion["seg_slices_img"]
-            img_shapes = cond_orion["img_shapes"]
-
-            orig_ndim = latent_in.ndim
-            H, W = latent_in.shape[-2], latent_in.shape[-1]
-            C = latent_in.shape[1] if (orig_ndim == 4 or latent_in.shape[1] != 1) else latent_in.shape[2]
-
-            syn_packed = _pack_latents_2d(latent_in)
-
-            # Sequence: [syn | ref | src]
-            packed_input = torch.cat(
-                [syn_packed, ref_latents.to(syn_packed.device, dtype=syn_packed.dtype)], dim=1
+        diffusion_model = _find_diffusion_model(model)
+        blocks = getattr(diffusion_model, "transformer_blocks", None)
+        if blocks is None:
+            raise RuntimeError(
+                "This node supports ComfyUI's native QwenImageTransformer2DModel "
+                "with diffusion_model.transformer_blocks."
             )
+        if len(blocks) != _TOTAL_BLOCKS:
+            raise RuntimeError(f"Expected 60 Qwen transformer blocks, found {len(blocks)}.")
 
-            # Pass Orion parameters into transformer_options
-            attn_kwargs = transformer_options.get("attention_kwargs", {}).copy()
-            attn_kwargs["seg_slices_img"] = seg_slices_img
-            attn_kwargs["soft_beta"] = soft_beta
-            transformer_options["attention_kwargs"] = attn_kwargs
-            transformer_options["orion_cond"] = cond_orion
-            c["transformer_options"] = transformer_options
-            c["img_shapes"] = img_shapes
+        state = load_file(path, device="cpu")
+        patched = model.clone()
+        existing = (
+            patched.model_options.get("transformer_options", {})
+            .get("patches_replace", {})
+            .get("dit", {})
+        )
 
-            out = apply_model(packed_input, args["timestep"], **c)
+        for index, block in enumerate(blocks):
+            attn = getattr(block, "attn", None)
+            if attn is None:
+                raise RuntimeError(f"Qwen block {index} has no .attn module.")
+            dim = int(getattr(attn, "inner_dim", attn.heads * attn.dim_head))
 
-            syn_out = out[:, :syn_packed.shape[1], :]
-            unpacked = _unpack_latents_2d(syn_out, H, W, C=C)
+            if index < _STAGE_A_END:
+                processor = OrionAttentionProcessor("A", dim)
+            elif index < _STAGE_B_END:
+                beta = 8.0 - 6.0 * ((index - _STAGE_A_END) / max(_STAGE_B_END - _STAGE_A_END - 1, 1))
+                processor = OrionAttentionProcessor("B", dim, soft_beta=beta)
+            else:
+                layer_state = _extract_layer_state(state, index)
+                required = {
+                    "proj.A1", "proj.A2", "proj.A3",
+                    "proj.B1", "proj.B2", "proj.B3",
+                    "synthesis_fusion_logits",
+                }
+                missing = required.difference(layer_state)
+                if missing:
+                    raise RuntimeError(
+                        f"Processor checkpoint is missing block {index} parameters: {sorted(missing)}"
+                    )
+                rank = int(layer_state["proj.A1"].shape[1])
+                if int(layer_state["proj.A1"].shape[0]) != dim:
+                    raise RuntimeError(
+                        f"Block {index} projector dimension {layer_state['proj.A1'].shape[0]} "
+                        f"does not match Qwen attention dimension {dim}."
+                    )
+                processor = OrionAttentionProcessor("C", dim, rank=rank)
+                processor.load_state_dict(layer_state, strict=True)
 
-            if orig_ndim == 5:
-                if latent_in.shape[1] == 1:
-                    unpacked = unpacked.unsqueeze(1)
-                else:
-                    unpacked = unpacked.unsqueeze(2)
+            previous = existing.get(("double_block", index))
+            patch = OrionBlockReplacement(attn, processor, mode, index, previous)
+            patched.set_model_patch_replace(patch, "dit", "double_block", index)
 
-            return unpacked
-
-        model.set_model_unet_function_wrapper(orion_unet_wrapper)
-        print(f"[OrionEdit] Function wrapper attached to model. Ready for KSampler.\n")
-        return (model,)
-
-
-# ==========================================
-# Custom Node 2: OrionEdit Prep Conditioning
-# ==========================================
-
-class OrionEditPrepConditioning:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "conditioning": ("CONDITIONING",),
-                "vae": ("VAE",),
-                "reference_image_1": ("IMAGE",),
-                "width": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 32}),
-                "height": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 32}),
-            },
-            "optional": {
-                "reference_image_2": ("IMAGE",),
-                "source_image": ("IMAGE",),
-            },
-        }
-
-    RETURN_TYPES = ("CONDITIONING", "LATENT")
-    FUNCTION = "prepare"
-    CATEGORY = "OrionEdit"
-
-    def prepare(self, conditioning, vae, reference_image_1, width, height,
-                reference_image_2=None, source_image=None):
-
-        print(f"\n[OrionEdit Prep] Preparing condition latents and image stream slices...")
-
-        def tensor2pil(img_tensor):
-            if img_tensor.ndim == 4:
-                img_tensor = img_tensor[0]
-            np_img = (img_tensor.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-            return Image.fromarray(np_img)
-
-        def pil2tensor(pil_img):
-            np_img = np.array(pil_img).astype(np.float32) / 255.0
-            return torch.from_numpy(np_img).unsqueeze(0)
-
-        # 1. Classify task mode (editing vs. fusion)
-        refs = [tensor2pil(reference_image_1)]
-        if reference_image_2 is not None:
-            refs.append(tensor2pil(reference_image_2))
-
-        has_source = source_image is not None
-        if has_source:
-            source_pil = tensor2pil(source_image)
-            composed_ref = _build_composited_reference_canvas(refs, source_pil)
-            condition_pils = [composed_ref, source_pil]
-            print(f"[OrionEdit Prep] Mode: EDITING (1 composited reference canvas + 1 source image)")
-        else:
-            condition_pils = refs
-            print(f"[OrionEdit Prep] Mode: FUSION ({len(refs)} reference images)")
-
-        # 2. Rescale condition images to target VAE dimensions and encode
-        vae_image_sizes = []
-        packed_cond_list = []
-        packed_lengths = []
-        detected_5d = False
-
-        for idx, img in enumerate(condition_pils):
-            vw, vh = calculate_dimensions(1024 * 1024, img.width / img.height)
-            vae_image_sizes.append((vw, vh))
-            img_resized = img.resize((vw, vh), Image.BICUBIC)
-
-            # Native VAE encode
-            lat = vae.encode(pil2tensor(img_resized)[:, :, :, :3])
-            print(f"[OrionEdit Prep] Condition Image {idx+1} ({vw}x{vh}) encoded to VAE latent shape: {list(lat.shape)}")
-            
-            if lat.ndim == 5:
-                detected_5d = True
-
-            packed_lat = _pack_latents_2d(lat)
-            packed_cond_list.append(packed_lat)
-            packed_lengths.append(packed_lat.shape[1])
-
-        packed_cond_latents = torch.cat(packed_cond_list, dim=1)
-        print(f"[OrionEdit Prep] Total packed condition sequence length: {packed_cond_latents.shape[1]}")
-
-        # 3. Compute slice indices and 3D positional grid shapes
-        L_syn = (height // 16) * (width // 16)
-        seg_slices_img = build_dns_seg_slices(L_syn, packed_lengths, has_source=has_source)
-        print(f"[OrionEdit Prep] Stream Slices -> syn: {seg_slices_img['syn']}, ref: {seg_slices_img['ref']}, src: {seg_slices_img['src']}")
-
-        img_shapes = [
-            [
-                (1, height // 16, width // 16),
-                *[(1, vh // 16, vw // 16) for vw, vh in vae_image_sizes],
-            ]
-        ]
-
-        # 4. Enrich conditioning dictionary for native KSampler
-        new_conditioning = []
-        for emb, meta in conditioning:
-            new_meta = meta.copy()
-            new_meta["orion_cond"] = {
-                "ref_latents": packed_cond_latents,
-                "seg_slices_img": seg_slices_img,
-                "img_shapes": img_shapes,
-            }
-            new_conditioning.append([emb, new_meta])
-
-        # 5. Output target noise latent placeholder matching VAE dimensionality (4D vs 5D)
-        if detected_5d:
-            sample_tensor = torch.zeros(1, 16, 1, height // 8, width // 8, dtype=torch.float32)
-        else:
-            sample_tensor = torch.zeros(1, 16, height // 8, width // 8, dtype=torch.float32)
-
-        print(f"[OrionEdit Prep] Target latent placeholder shape: {list(sample_tensor.shape)}\n")
-        latent_target = {"samples": sample_tensor}
-
-        return (new_conditioning, latent_target)
+        return (patched,)
 
 # ==========================================
-# Custom Node 3: OrionEdit helper
+# Custom Node 2: OrionEdit helper
 # ==========================================
 import inspect
 import torch
@@ -521,13 +713,11 @@ class QwenAttentionSpyNode:
 # ==========================================
 
 NODE_CLASS_MAPPINGS = {
-    "ApplyOrionEditPatcher": ApplyOrionEditPatcher,
-    "OrionEditPrepConditioning": OrionEditPrepConditioning,
+    "ApplyOrionEditAttention": ApplyOrionEditAttention,
     "QwenAttentionSpyNode": QwenAttentionSpyNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ApplyOrionEditPatcher": "Apply OrionEdit Patcher",
-    "OrionEditPrepConditioning": "OrionEdit Prep Latents & Conditioning",
+    "ApplyOrionEditAttention": "Apply OrionEdit Attention (Qwen INT8)",
     "QwenAttentionSpyNode": "Debug Qwen Attention Spy",
 }
