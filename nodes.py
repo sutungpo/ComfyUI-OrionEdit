@@ -2,13 +2,31 @@
 # Custom Node 1: OrionEdit ApplyOrionEditAttention
 # ==========================================
 import os
+import logging
+import threading
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import folder_paths
 from safetensors.torch import load_file
 
+logger = logging.getLogger("OrionEdit")
+
 A_END, B_END, N_BLOCKS = 20, 40, 60
+_REQUIRED_STAGE_C = {
+    "proj.A1", "proj.A2", "proj.A3",
+    "proj.B1", "proj.B2", "proj.B3",
+    "synthesis_fusion_logits",
+}
+
+
+def _stage(index):
+    if index < A_END:
+        return "A"
+    if index < B_END:
+        return "B"
+    return "C"
 
 
 def _rope(q, k, pe):
@@ -19,41 +37,75 @@ def _rope(q, k, pe):
 
 
 def _sdpa(q, k, v, mask=None):
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
+    )
 
 
 def _segments(opts, n_img, mode):
     lengths = opts.get("reference_image_num_tokens")
-    if not lengths:
-        raise RuntimeError("OrionEdit requires Qwen ref_latents; reference_image_num_tokens is missing.")
+    if lengths is None or len(lengths) == 0:
+        raise RuntimeError(
+            "[OrionEdit] Qwen reference_image_num_tokens is missing. "
+            "Check that the Qwen Image Edit conditioning path supplies ref_latents."
+        )
+
     lengths = [int(x) for x in lengths]
     if any(x <= 0 for x in lengths):
-        raise RuntimeError(f"Invalid reference token lengths: {lengths}")
+        raise RuntimeError(f"[OrionEdit] Invalid reference token lengths: {lengths}")
+
     if mode == "edit":
         if len(lengths) != 2:
-            raise RuntimeError(f"Edit mode requires [reference, source] token lengths; got {lengths}.")
+            raise RuntimeError(
+                "[OrionEdit] Edit mode expects exactly [reference_tokens, source_tokens]; "
+                f"received {lengths}. For multiple references, combine them into one "
+                "reference canvas before Qwen encoding."
+            )
         nr, ns = lengths
-    else:
+    elif mode == "fusion":
         nr, ns = sum(lengths), 0
+    else:
+        raise RuntimeError(f"[OrionEdit] Unsupported mode: {mode}")
+
     nz = n_img - nr - ns
     if nz <= 0:
-        raise RuntimeError(f"Invalid stream sizes: image tokens={n_img}, reference/source={lengths}.")
-    return slice(0, nz), slice(nz, nz + nr), slice(nz + nr, nz + nr + ns)
+        raise RuntimeError(
+            f"[OrionEdit] Invalid image stream sizes: image_tokens={n_img}, "
+            f"reference/source token lengths={lengths}."
+        )
+
+    return (
+        slice(0, nz),
+        slice(nz, nz + nr),
+        slice(nz + nr, nz + nr + ns),
+    )
 
 
 def _text_mask(x, text_mask, nt, total):
     if text_mask is None:
         return None
-    m = torch.zeros((x.shape[0], 1, 1, total), device=x.device, dtype=x.dtype)
-    m[..., :nt] = text_mask.reshape(x.shape[0], 1, 1, nt).to(device=x.device, dtype=x.dtype)
+    m = torch.zeros(
+        (x.shape[0], 1, 1, total), device=x.device, dtype=x.dtype
+    )
+    m[..., :nt] = text_mask.reshape(x.shape[0], 1, 1, nt).to(
+        device=x.device, dtype=x.dtype
+    )
     return m
 
 
-def _flow_mask(base, batch, total, nt, syn, ref, src, device, dtype, hard, beta):
-    m = torch.zeros((batch, 1, total, total), device=device, dtype=dtype) if base is None else base.expand(batch, 1, total, total).clone()
-    syn, ref, src = (slice(nt + s.start, nt + s.stop) for s in (syn, ref, src))
+def _flow_mask(base, batch, total, nt, syn, ref, src,
+               device, dtype, hard, beta):
+    if base is None:
+        m = torch.zeros((batch, 1, total, total), device=device, dtype=dtype)
+    else:
+        m = base.expand(batch, 1, total, total).clone()
+
+    syn, ref, src = (
+        slice(nt + s.start, nt + s.stop) for s in (syn, ref, src)
+    )
     txt = slice(0, nt)
     blocked = torch.finfo(dtype).min
+
     def block(q, k):
         if q.start == q.stop or k.start == k.stop:
             return
@@ -61,11 +113,27 @@ def _flow_mask(base, batch, total, nt, syn, ref, src, device, dtype, hard, beta)
             m[:, :, q, k] = blocked
         else:
             m[:, :, q, k] -= beta
-    block(ref, txt); block(ref, syn)
+
+    # OrionEdit reverse-causal image-stream restrictions.
+    block(ref, txt)
+    block(ref, syn)
     if src.stop > src.start:
         block(ref, src)
-    block(src, txt); block(src, syn)
+    block(src, txt)
+    block(src, syn)
     return m
+
+
+def _debug_tensor(label, tensor):
+    if not logger.isEnabledFor(logging.DEBUG) or tensor is None:
+        return
+    finite = bool(torch.isfinite(tensor).all().item())
+    logger.debug(
+        "[OrionEdit] %s: shape=%s dtype=%s device=%s finite=%s",
+        label, tuple(tensor.shape), tensor.dtype, tensor.device, finite
+    )
+    if not finite:
+        raise RuntimeError(f"[OrionEdit] Non-finite values detected in {label}.")
 
 
 class _Projector(nn.Module):
@@ -92,95 +160,229 @@ class _StageC(nn.Module):
         self.proj = _Projector(d, rank)
         self.synthesis_fusion_logits = nn.Parameter(torch.zeros(3))
 
-    def forward(self, attn, x, text, text_mask, pe, opts, mode, q, k, v, tq, tk, tv):
-        if next(self.parameters()).device != x.device or next(self.parameters()).dtype != x.dtype:
+    def forward(self, attn, x, text, text_mask, pe, opts, mode,
+                q, k, v, tq, tk, tv):
+        first_param = next(self.parameters())
+        if first_param.device != x.device or first_param.dtype != x.dtype:
             self.to(device=x.device, dtype=x.dtype)
+
         b, ni, _ = x.shape
         nt, h = text.shape[1], attn.heads
         total = nt + ni
         base_mask = _text_mask(x, text_mask, nt, total)
-        base = _sdpa(q, k, v, base_mask).transpose(1, 2).reshape(b, total, -1).to(q.dtype)
+        base = _sdpa(q, k, v, base_mask).transpose(1, 2).reshape(
+            b, total, -1
+        ).to(q.dtype)
+
         txt_out, img_out = base[:, :nt], base[:, nt:].clone()
         syn, ref, src = _segments(opts, ni, mode)
+
         qm = q[:, :, nt:].transpose(1, 2).reshape(b, ni, -1)
         km = k[:, :, nt:].transpose(1, 2).reshape(b, ni, -1)
         vm = v[:, :, nt:].transpose(1, 2).reshape(b, ni, -1)
         tkm = k[:, :, :nt].transpose(1, 2).reshape(b, nt, -1)
         tvm = tv.transpose(1, 2).reshape(b, nt, -1)
+
         p = self.proj
         qz, kz, vz = qm[:, syn], km[:, syn], vm[:, syn]
-        kz1 = p.apply(kz, p.A1, p.B1, p.alpha); vz1 = p.apply(vz, p.A1, p.B1, p.alpha)
+        kz1 = p.apply(kz, p.A1, p.B1, p.alpha)
+        vz1 = p.apply(vz, p.A1, p.B1, p.alpha)
         kr = p.apply(km[:, ref], p.A2, p.B2, p.alpha)
         vr = p.apply(vm[:, ref], p.A2, p.B2, p.alpha)
         qr = p.apply(qz, p.A2, p.B2, p.alpha)
+
         if src.stop > src.start:
             ks = p.apply(km[:, src], p.A3, p.B3, p.alpha)
             vs = p.apply(vm[:, src], p.A3, p.B3, p.alpha)
             qs = p.apply(qz, p.A3, p.B3, p.alpha)
-            bk, bv, bq = torch.cat((tkm, kz1, kr, ks), 1), torch.cat((tvm, vz1, vr, vs), 1), torch.cat((qr, qs), 1)
+            bk = torch.cat((tkm, kz1, kr, ks), 1)
+            bv = torch.cat((tvm, vz1, vr, vs), 1)
+            bq = torch.cat((qr, qs), 1)
         else:
             qa = p.apply(qz, p.A1, p.B1, p.alpha)
-            bk, bv, bq = torch.cat((tkm, kz1, kr), 1), torch.cat((tvm, vz1, vr), 1), torch.cat((qr, qa), 1)
+            bk = torch.cat((tkm, kz1, kr), 1)
+            bv = torch.cat((tvm, vz1, vr), 1)
+            bq = torch.cat((qr, qa), 1)
+
         bq = bq.view(b, bq.shape[1], h, -1).transpose(1, 2).contiguous()
         bk = bk.view(b, bk.shape[1], h, -1).transpose(1, 2).contiguous()
         bv = bv.view(b, bv.shape[1], h, -1).transpose(1, 2).contiguous()
-        branch = _sdpa(bq, bk, bv).transpose(1, 2).reshape(b, bq.shape[2], -1).to(bq.dtype)
+
+        _debug_tensor("Stage C projected queries", bq)
+        _debug_tensor("Stage C projected keys", bk)
+        _debug_tensor("Stage C projected values", bv)
+
+        branch = _sdpa(bq, bk, bv).transpose(1, 2).reshape(
+            b, bq.shape[2], -1
+        ).to(bq.dtype)
+
         nz = syn.stop - syn.start
-        w = torch.softmax(self.synthesis_fusion_logits, dim=0)
-        img_out[:, syn] = w[0] * img_out[:, syn] + w[1] * branch[:, :nz] + w[2] * branch[:, nz:2*nz]
+        weights = torch.softmax(self.synthesis_fusion_logits, dim=0)
+        img_out[:, syn] = (
+            weights[0] * img_out[:, syn]
+            + weights[1] * branch[:, :nz]
+            + weights[2] * branch[:, nz:2 * nz]
+        )
+
         img_out = attn.to_out[0](img_out)
         if len(attn.to_out) > 1:
             img_out = attn.to_out[1](img_out)
+
+        _debug_tensor("Stage C image output", img_out)
         return img_out, attn.to_add_out(txt_out)
 
 
 def _attention(processor, attn, x, text, text_mask, pe, opts, mode, index):
     if text is None:
-        raise RuntimeError("OrionEdit requires the Qwen text stream.")
-    b, ni, _ = x.shape; nt = text.shape[1]; h = attn.heads
+        raise RuntimeError("[OrionEdit] Qwen text stream is missing.")
+
+    b, ni, _ = x.shape
+    nt, h = text.shape[1], attn.heads
+
     iq = attn.to_q(x).view(b, ni, h, -1).transpose(1, 2).contiguous()
     ik = attn.to_k(x).view(b, ni, h, -1).transpose(1, 2).contiguous()
     iv = attn.to_v(x).view(b, ni, h, -1).transpose(1, 2)
     tq = attn.add_q_proj(text).view(b, nt, h, -1).transpose(1, 2).contiguous()
     tk = attn.add_k_proj(text).view(b, nt, h, -1).transpose(1, 2).contiguous()
     tv = attn.add_v_proj(text).view(b, nt, h, -1).transpose(1, 2)
-    iq, ik, tq, tk = attn.norm_q(iq), attn.norm_k(ik), attn.norm_added_q(tq), attn.norm_added_k(tk)
-    q, k, v = torch.cat((tq, iq), 2), torch.cat((tk, ik), 2), torch.cat((tv, iv), 2)
-    from comfy.ldm.flux.math import apply_rope1
+
+    iq, ik = attn.norm_q(iq), attn.norm_k(ik)
+    tq, tk = attn.norm_added_q(tq), attn.norm_added_k(tk)
+
+    q = torch.cat((tq, iq), 2)
+    k = torch.cat((tk, ik), 2)
+    v = torch.cat((tv, iv), 2)
+
     if pe is not None:
+        from comfy.ldm.flux.math import apply_rope1
         q, k = apply_rope1(q, pe), apply_rope1(k, pe)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        _debug_tensor(f"Block {index} Q", q)
+        _debug_tensor(f"Block {index} K", k)
+        _debug_tensor(f"Block {index} V", v)
+
     if index >= B_END:
-        return processor(attn, x, text, text_mask, pe, opts, mode, q, k, v, tq, tk, tv)
+        return processor(
+            attn, x, text, text_mask, pe, opts, mode,
+            q, k, v, tq, tk, tv
+        )
+
     syn, ref, src = _segments(opts, ni, mode)
     base = _text_mask(x, text_mask, nt, nt + ni)
+
     if index < A_END:
-        mask = _flow_mask(base, b, nt + ni, nt, syn, ref, src, x.device, x.dtype, True, 0.0)
+        mask = _flow_mask(
+            base, b, nt + ni, nt, syn, ref, src,
+            x.device, x.dtype, True, 0.0
+        )
     else:
-        beta = 8.0 - 6.0 * ((index - A_END) / (B_END - A_END - 1))
-        mask = _flow_mask(base, b, nt + ni, nt, syn, ref, src, x.device, x.dtype, False, beta)
-    out = _sdpa(q, k, v, mask).transpose(1, 2).reshape(b, nt + ni, -1).to(q.dtype)
+        beta = 8.0 - 6.0 * (
+            (index - A_END) / (B_END - A_END - 1)
+        )
+        mask = _flow_mask(
+            base, b, nt + ni, nt, syn, ref, src,
+            x.device, x.dtype, False, beta
+        )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "[OrionEdit] Block %d mask: shape=%s dtype=%s device=%s",
+            index, tuple(mask.shape), mask.dtype, mask.device
+        )
+        _debug_tensor(f"Block {index} attention mask", mask)
+
+    out = _sdpa(q, k, v, mask).transpose(1, 2).reshape(
+        b, nt + ni, -1
+    ).to(q.dtype)
+
     txt_out, img_out = out[:, :nt], out[:, nt:]
     img_out = attn.to_out[0](img_out)
     if len(attn.to_out) > 1:
         img_out = attn.to_out[1](img_out)
+
+    _debug_tensor(f"Block {index} image output", img_out)
     return img_out, attn.to_add_out(txt_out)
 
 
 class _BlockPatch:
     def __init__(self, block, processor, mode, index, previous=None):
-        self.block, self.processor, self.mode, self.index, self.previous = block, processor, mode, index, previous
+        self.block = block
+        self.processor = processor
+        self.mode = mode
+        self.index = index
+        self.previous = previous
+        self._logged_runtime = False
+        self._log_lock = threading.Lock()
+
+    def _log_first_execution(self, hidden_states, encoder_hidden_states, opts):
+        with self._log_lock:
+            if self._logged_runtime:
+                return
+            self._logged_runtime = True
+
+        ni = hidden_states.shape[1]
+        nt = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+        lengths = opts.get("reference_image_num_tokens")
+        syn, ref, src = _segments(opts, ni, self.mode)
+
+        if self.index < A_END:
+            detail = "hard reverse-causal mask"
+        elif self.index < B_END:
+            beta = 8.0 - 6.0 * (
+                (self.index - A_END) / (B_END - A_END - 1)
+            )
+            detail = f"soft reverse-causal mask; beta={beta:.4f}"
+        else:
+            detail = "decoupled attention with Stage C projector"
+
+        logger.info(
+            "[OrionEdit] Runtime Stage %s block %d: EXECUTED (%s)",
+            _stage(self.index), self.index, detail
+        )
+        logger.info(
+            "[OrionEdit] Block %d streams: mode=%s, "
+            "reference_image_num_tokens=%s, text_tokens=%d, image_tokens=%d, "
+            "syn=[%d:%d] (%d), ref=[%d:%d] (%d), src=[%d:%d] (%d)",
+            self.index, self.mode, lengths, nt, ni,
+            syn.start, syn.stop, syn.stop - syn.start,
+            ref.start, ref.stop, ref.stop - ref.start,
+            src.start, src.stop, src.stop - src.start
+        )
+        logger.info(
+            "[OrionEdit] Block %d hidden states: shape=%s dtype=%s device=%s",
+            self.index, tuple(hidden_states.shape),
+            hidden_states.dtype, hidden_states.device
+        )
 
     def __call__(self, args, extra):
         attn = self.block.attn
         original = attn.forward
-        def patched_forward(hidden_states, encoder_hidden_states=None, encoder_hidden_states_mask=None,
-                            attention_mask=None, image_rotary_emb=None, transformer_options=None, **kwargs):
-            return _attention(self.processor, attn, hidden_states, encoder_hidden_states,
-                              encoder_hidden_states_mask, image_rotary_emb, transformer_options or {},
-                              self.mode, self.index)
+
+        def patched_forward(
+            hidden_states,
+            encoder_hidden_states=None,
+            encoder_hidden_states_mask=None,
+            attention_mask=None,
+            image_rotary_emb=None,
+            transformer_options=None,
+            **kwargs
+        ):
+            opts = transformer_options or {}
+            self._log_first_execution(hidden_states, encoder_hidden_states, opts)
+            return _attention(
+                self.processor, attn, hidden_states, encoder_hidden_states,
+                encoder_hidden_states_mask, image_rotary_emb, opts,
+                self.mode, self.index
+            )
+
         attn.forward = patched_forward
         try:
-            return self.previous(args, extra) if self.previous is not None else extra["original_block"](args)
+            return (
+                self.previous(args, extra)
+                if self.previous is not None
+                else extra["original_block"](args)
+            )
         finally:
             attn.forward = original
 
@@ -196,17 +398,26 @@ class _BlockPatch:
             self.previous.cleanup()
 
     def models(self):
-        return self.previous.models() if self.previous is not None and hasattr(self.previous, "models") else []
+        return (
+            self.previous.models()
+            if self.previous is not None and hasattr(self.previous, "models")
+            else []
+        )
 
 
 class ApplyOrionEditAttention:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {
-            "model": ("MODEL",),
-            "mode": (["edit", "fusion"], {"default": "edit"}),
-            "processor_weights": ("STRING", {"default": "orionedit/pytorch_processor_weights.safetensors"}),
-        }}
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "mode": (["edit", "fusion"], {"default": "edit"}),
+                "processor_weights": (
+                    "STRING",
+                    {"default": "orionedit/pytorch_processor_weights.safetensors"}
+                ),
+            }
+        }
 
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
@@ -215,44 +426,126 @@ class ApplyOrionEditAttention:
 
     def apply(self, model, mode, processor_weights):
         if not hasattr(model, "clone") or not hasattr(model, "set_model_patch_replace"):
-            raise TypeError("Expected a ComfyUI MODEL patcher input.")
+            raise TypeError("[OrionEdit] Expected a ComfyUI MODEL patcher input.")
+
         path = processor_weights.strip()
         if not os.path.isabs(path):
             path = os.path.join(folder_paths.models_dir, path)
         if not os.path.isfile(path):
-            raise FileNotFoundError(f"OrionEdit processor weights not found: {path}")
+            raise FileNotFoundError(
+                f"[OrionEdit] Processor weights not found: {path}"
+            )
+
+        logger.info("[OrionEdit] Loading processor weights: %s", path)
         state = load_file(path, device="cpu")
+
         patched = model.clone()
         diffusion_model = patched.get_model_object("diffusion_model")
         blocks = getattr(diffusion_model, "transformer_blocks", None)
-        if blocks is None or len(blocks) != N_BLOCKS:
-            raise RuntimeError(f"Expected the 60-block Qwen Image Edit transformer; found {len(blocks) if blocks is not None else 0} blocks.")
-        replacements = patched.model_options.get("transformer_options", {}).get("patches_replace", {}).get("dit", {})
+        block_count = len(blocks) if blocks is not None else 0
+        if block_count != N_BLOCKS:
+            raise RuntimeError(
+                f"[OrionEdit] Expected {N_BLOCKS} Qwen transformer blocks; "
+                f"found {block_count}."
+            )
+
+        replacements = (
+            patched.model_options.get("transformer_options", {})
+            .get("patches_replace", {}).get("dit", {})
+        )
+
+        stage_c_count = 0
         for i, block in enumerate(blocks):
             attn = getattr(block, "attn", None)
-            if attn is None or not hasattr(attn, "to_q") or not hasattr(attn, "add_q_proj"):
-                raise RuntimeError(f"Block {i} is not the expected Qwen double-stream attention block.")
+            if (
+                attn is None
+                or not hasattr(attn, "to_q")
+                or not hasattr(attn, "add_q_proj")
+            ):
+                raise RuntimeError(
+                    f"[OrionEdit] Block {i} is not the expected Qwen "
+                    "double-stream attention block."
+                )
+
+            if i == 0:
+                logger.info(
+                    "[OrionEdit] Model=%s; blocks=%d; mode=%s",
+                    type(diffusion_model).__name__, block_count, mode
+                )
+                logger.info(
+                    "[OrionEdit] INT8 projection modules: "
+                    "to_q=%s, to_k=%s, to_v=%s, to_out=%s",
+                    type(attn.to_q).__name__, type(attn.to_k).__name__,
+                    type(attn.to_v).__name__, type(attn.to_out[0]).__name__
+                )
+
             processor = None
             if i >= B_END:
                 prefix = f"transformer.transformer_blocks.{i}.attn.processor."
-                sd = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
-                required = {"proj.A1", "proj.A2", "proj.A3", "proj.B1", "proj.B2", "proj.B3", "synthesis_fusion_logits"}
-                missing = required - set(sd)
+                sd = {
+                    k[len(prefix):]: v
+                    for k, v in state.items()
+                    if k.startswith(prefix)
+                }
+                missing = _REQUIRED_STAGE_C - set(sd)
                 if missing:
-                    raise RuntimeError(f"Missing Stage C weights for block {i}: {sorted(missing)}")
-                rank, d = int(sd["proj.B1"].shape[0]), int(sd["proj.A1"].shape[0])
-                model_d = int(getattr(attn, "inner_dim", attn.heads * attn.dim_head))
+                    raise RuntimeError(
+                        f"[OrionEdit] Missing Stage C weights for block {i}: "
+                        f"{sorted(missing)}"
+                    )
+
+                rank = int(sd["proj.B1"].shape[0])
+                d = int(sd["proj.A1"].shape[0])
+                model_d = int(
+                    getattr(attn, "inner_dim", attn.heads * attn.dim_head)
+                )
                 if d != model_d:
-                    raise RuntimeError(f"Stage C dimension mismatch at block {i}: checkpoint {d}, model {model_d}.")
+                    raise RuntimeError(
+                        f"[OrionEdit] Stage C dimension mismatch at block {i}: "
+                        f"checkpoint={d}, model={model_d}."
+                    )
+
+                for key in _REQUIRED_STAGE_C:
+                    if not torch.isfinite(sd[key]).all():
+                        raise RuntimeError(
+                            f"[OrionEdit] Non-finite processor weight "
+                            f"{key} in block {i}."
+                        )
+
                 processor = _StageC(d, rank)
                 processor.load_state_dict(sd, strict=True)
+                stage_c_count += 1
+
             key = ("double_block", i)
             previous = replacements.get(key)
             if isinstance(previous, _BlockPatch):
-                raise RuntimeError("OrionEdit attention is already applied to this model.")
-            patched.set_model_patch_replace(_BlockPatch(block, processor, mode, i, previous), "dit", "double_block", i)
-        return (patched,)
+                raise RuntimeError(
+                    "[OrionEdit] OrionEdit attention is already applied "
+                    "to this model."
+                )
 
+            patch = _BlockPatch(block, processor, mode, i, previous)
+            patched.set_model_patch_replace(
+                patch, "dit", "double_block", i
+            )
+
+        if stage_c_count != 20:
+            raise RuntimeError(
+                f"[OrionEdit] Expected 20 Stage C processors; loaded {stage_c_count}."
+            )
+
+        logger.info(
+            "[OrionEdit] Patch installation complete: "
+            "Stage A=20 blocks (0-19), Stage B=20 blocks (20-39), "
+            "Stage C=20 blocks (40-59); Stage C processors loaded=%d.",
+            stage_c_count
+        )
+        logger.info(
+            "[OrionEdit] Runtime logs are emitted once per block. "
+            "Set logging level DEBUG for tensor/mask diagnostics and "
+            "NaN/Inf checks."
+        )
+        return (patched,)
 
 # ==========================================
 # Custom Node 2: OrionEdit helper
