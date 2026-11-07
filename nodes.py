@@ -354,8 +354,6 @@ class OrionEditPrepConditioning:
 # Custom Node 3: OrionEdit helper
 # ==========================================
 import inspect
-import os
-import sys
 import torch
 import torch.nn.functional as F
 
@@ -377,24 +375,50 @@ class QwenAttentionSpyNode:
         print("[AttentionSpy] STATIC ATTENTION INSPECTION")
         print("=" * 80)
 
-        diff_model = model.diffusion_model
-        print(f"[*] Diffusion Model: {diff_model.__class__.__module__}.{diff_model.__class__.__name__}")
+        # 1. Safely unwrap ComfyUI ModelPatcher / ModelPatcherDynamic
+        print(f"[*] Outer Model Wrapper: {model.__class__.__name__}")
+        
+        # Traverse down through .model and .diffusion_model
+        target = model
+        if hasattr(target, "model"):
+            target = target.model
+            print(f"[*] Unwrapped inner model: {target.__class__.__name__}")
+            
+        if hasattr(target, "diffusion_model"):
+            diff_model = target.diffusion_model
+            print(f"[*] Found diffusion_model: {diff_model.__class__.__module__}.{diff_model.__class__.__name__}")
+        else:
+            diff_model = target
+            print(f"[*] Using root model: {diff_model.__class__.__module__}.{diff_model.__class__.__name__}")
+
         print(f"[*] Defined in File: {inspect.getfile(diff_model.__class__)}")
 
-        # 1. Locate Transformer Blocks
+        # 2. Locate Transformer Blocks
         blocks = None
-        for attr in ["transformer_blocks", "double_blocks", "blocks", "layers"]:
-            if hasattr(diff_model, attr):
-                blocks = getattr(diff_model, attr)
+        blocks_attr_name = None
+        # Check both diff_model and outer target in case blocks are top-level
+        for candidate in [diff_model, getattr(model, "model", None), model]:
+            if candidate is None:
+                continue
+            for attr in ["transformer_blocks", "double_blocks", "blocks", "layers"]:
+                if hasattr(candidate, attr):
+                    blocks = getattr(candidate, attr)
+                    blocks_attr_name = attr
+                    diff_model = candidate
+                    break
+            if blocks is not None:
                 break
 
         if blocks is None:
-            print("[X] Could not locate transformer blocks.")
+            print("[X] Could not locate transformer blocks. Available attributes on model:")
+            print(dir(diff_model))
             return (model,)
 
+        print(f"[*] Found {len(blocks)} transformer blocks under attribute: '{blocks_attr_name}'")
         sample_block = blocks[0]
-        
-        # 2. Locate Attention Module
+        print(f"[*] Block 0 Class: {sample_block.__class__.__name__}")
+
+        # 3. Locate Attention Submodule
         attn_module = None
         attn_attr = None
         for attr in ["attn", "attn1", "self_attn", "joint_attn"]:
@@ -404,16 +428,18 @@ class QwenAttentionSpyNode:
                 break
 
         if attn_module is None:
-            print("[X] Could not locate attention module inside block.")
+            print("[X] Could not locate attention submodule in block. Available block children:")
+            for n, _ in sample_block.named_children():
+                print(f"    - {n}")
             return (model,)
 
-        # 3. Log Module Identity & Source File
+        # 4. Log Module Identity & Source File
         attn_cls = attn_module.__class__
         print(f"[*] Attention Attribute: block.{attn_attr}")
         print(f"[*] Attention Class:     {attn_cls.__module__}.{attn_cls.__name__}")
         print(f"[*] Defined in File:     {inspect.getfile(attn_cls)}")
 
-        # 4. Check for Diffusers-style Processor vs Native Forward
+        # 5. Check for Diffusers-style Processor vs Native Forward
         if hasattr(attn_module, "processor"):
             proc = attn_module.processor
             print(f"[*] Execution Delegate:  Uses .processor -> {proc.__class__.__module__}.{proc.__class__.__name__}")
@@ -423,22 +449,22 @@ class QwenAttentionSpyNode:
             print("[*] Execution Delegate:  Native forward method (No .processor attribute)")
             exec_target = attn_module.forward
 
-        # 5. Print Source Code of the Attention Forward Implementation
+        # 6. Print Source Code of the Attention Implementation
         print("\n" + "-" * 80)
         print("[AttentionSpy] SOURCE CODE OF THE EXECUTING ATTENTION FUNCTION:")
         print("-" * 80)
         try:
             source_lines, start_line = inspect.getsourcelines(exec_target)
             print(f"// File: {inspect.getfile(exec_target)} (Lines {start_line}-{start_line + len(source_lines)})")
-            for line in source_lines[:45]:  # print first 45 lines
+            for line in source_lines[:50]:  # print first 50 lines
                 print(line, end="")
-            if len(source_lines) > 45:
+            if len(source_lines) > 50:
                 print("\n... [truncated for readability] ...")
         except Exception as e:
             print(f"Could not retrieve source code: {e}")
         print("-" * 80 + "\n")
 
-        # 6. Runtime Trap: Intercept the Exact Low-Level Attention Function
+        # 7. Runtime Trap: Intercept the exact SDPA computation
         active_block_idx = {"current": None}
         original_sdpa = F.scaled_dot_product_attention
 
@@ -447,7 +473,7 @@ class QwenAttentionSpyNode:
                 b_idx = active_block_idx["current"]
                 active_block_idx["current"] = None  # log only once per step
 
-                # Examine caller stack
+                # Caller frame analysis
                 stack = inspect.stack()
                 caller_frame = stack[1]
                 
@@ -463,24 +489,22 @@ class QwenAttentionSpyNode:
                 print(f"[*] Attention Mask:       {'Present ' + str(list(attn_mask.shape)) if attn_mask is not None else 'None (Fully Bidirectional)'}")
                 print(f"[*] Dropout / Causal:     dropout={dropout_p}, is_causal={is_causal}")
 
-                # Detect Active PyTorch SDPA Backend
                 if torch.cuda.is_available():
                     backends = {
                         "FlashAttention": torch.backends.cuda.flash_sdp_enabled(),
-                        "MemEfficient (xformers-like)": torch.backends.cuda.mem_efficient_sdp_enabled(),
-                        "Math (standard)": torch.backends.cuda.math_sdp_enabled(),
+                        "MemEfficient": torch.backends.cuda.mem_efficient_sdp_enabled(),
+                        "Math": torch.backends.cuda.math_sdp_enabled(),
                     }
-                    print(f"[*] Enabled PyTorch SDPA Backends: {backends}")
+                    print(f"[*] Enabled SDPA Backends: {backends}")
                 print("=" * 80 + "\n")
 
             if scale is not None:
                 return original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
             return original_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal)
 
-        # Apply interceptor
         F.scaled_dot_product_attention = sdpa_interceptor
 
-        # Attach pre-hook to know which block is active
+        # Attach pre-hook
         def pre_hook(idx):
             def _fn(module, args, kwargs):
                 active_block_idx["current"] = idx
